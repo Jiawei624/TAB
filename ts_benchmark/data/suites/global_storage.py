@@ -48,6 +48,7 @@ class GlobalStorageDataServer(DataServer):
         logger.info("Data server started.")
 
 
+# 每个worker使用的数据池实现
 class GlobalStorageDataPool(DataPoolImpl):
     """
     A simple DataPool that retrieves all data from the globals storage at once
@@ -62,6 +63,7 @@ class GlobalStorageDataPool(DataPoolImpl):
         self.storage = storage
         self._global_dataset = None
 
+    # 获取时间序列
     def get_series(self, name: str) -> Optional[pd.DataFrame]:
         """
         Gets the time series from the global storage
@@ -76,6 +78,7 @@ class GlobalStorageDataPool(DataPoolImpl):
             raise ValueError("Data is not ready.")
         return self._global_dataset.get_series(name)
 
+    # 获取协变量
     def get_covariates(self, name: str) -> Optional[Dict]:
         """
         Gets the covariates of time series from the global storage
@@ -90,6 +93,7 @@ class GlobalStorageDataPool(DataPoolImpl):
             raise ValueError("Data covariates is not ready.")
         return self._global_dataset.get_covariates(name)
 
+    # 获取元数据
     def get_series_meta_info(self, name: str) -> Optional[pd.Series]:
         """
         Gets the time series meta-info from the global storage
@@ -104,6 +108,7 @@ class GlobalStorageDataPool(DataPoolImpl):
             raise ValueError("Data is not ready.")
         return self._global_dataset.get_series_meta_info(name)
 
+    # 从全局存储中同步数据
     def sync_data(self) -> NoReturn:
         """
         Synchronizes data from the global storage
@@ -118,8 +123,10 @@ class GlobalStorageDataPool(DataPoolImpl):
         """
         dataset_class_module = self.storage.get("dataset_class_module")
         dataset_class_name = self.storage.get("dataset_class_name")
-        dataset_class = getattr(importlib.import_module(dataset_class_module), dataset_class_name)
-        dataset = dataset_class()
+        dataset_class = getattr(
+            importlib.import_module(dataset_class_module), dataset_class_name
+        )
+        dataset = dataset_class()  # 实际上就是Dataset()
         dataset.set_state(self.storage.get("dataset_state"))
         return dataset
 

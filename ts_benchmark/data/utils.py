@@ -9,6 +9,7 @@ import scipy.sparse
 
 logger = logging.getLogger(__name__)
 
+# Pandas推断出的频率代码，生成元数据使用
 FREQ_MAP = {
     "Y": "yearly",
     "A": "yearly",
@@ -130,11 +131,13 @@ FREQ_MAP = {
     "UNKNOWN": "other",
 }
 
+# 协变量名到读取函数的映射
 COVARIATES_LOAD_METHOD = {
     "adj.npz": scipy.sparse.load_npz,
 }
 
 
+# 区分普通数据与时空数据
 def is_st(data: pd.DataFrame) -> bool:
     """
     Checks if data of the CSV file are in spatial-temporal format.
@@ -145,6 +148,7 @@ def is_st(data: pd.DataFrame) -> bool:
     return data.shape[1] == 4
 
 
+# 读取一个序列的协变量目录
 def read_covariates(folder_path: str) -> Optional[Dict]:
     """
     Reads all covariates in the directory and returns a dictionary
@@ -171,6 +175,7 @@ def read_covariates(folder_path: str) -> Optional[Dict]:
     return covariates
 
 
+# 读取协变量
 def get_covariate(file_path: str) -> Any:
     """
     Reads a covariate file and returns its content.
@@ -186,6 +191,7 @@ def get_covariate(file_path: str) -> Any:
     return COVARIATES_LOAD_METHOD[covariate_type](file_path)
 
 
+# csv数据的统一入口
 def read_data(path: str, nrows=None) -> Union[pd.DataFrame, np.ndarray]:
     """
     Read the data file and return DataFrame.If the data is spatial-temporal format,
@@ -202,6 +208,7 @@ def read_data(path: str, nrows=None) -> Union[pd.DataFrame, np.ndarray]:
         return process_data_df(data, nrows)
 
 
+# 将普通时序数据由长表转换为宽表
 def process_data_df(data: pd.DataFrame, nrows=None) -> pd.DataFrame:
     """
     Read the data file and return DataFrame.
@@ -217,6 +224,7 @@ def process_data_df(data: pd.DataFrame, nrows=None) -> pd.DataFrame:
 
     columns = data.columns
 
+    # 计算每个变量出现的最多次数
     if columns[0] == "date":
         n_points = data.iloc[:, 2].value_counts().max()
     else:
@@ -229,6 +237,7 @@ def process_data_df(data: pd.DataFrame, nrows=None) -> pd.DataFrame:
 
     cols_name = data["cols"].unique()
 
+    # 带data列并且是多变量
     if columns[0] == "date" and not is_univariate:
         df["date"] = data.iloc[:n_points, 0]
         col_data = {
@@ -239,6 +248,7 @@ def process_data_df(data: pd.DataFrame, nrows=None) -> pd.DataFrame:
         df["date"] = pd.to_datetime(df["date"])
         df.set_index("date", inplace=True)
 
+    # 不带date列并且是多变量
     elif columns[0] != "date" and not is_univariate:
         col_data = {
             cols_name[j]: data.iloc[j * n_points : (j + 1) * n_points, 0].tolist()
@@ -246,6 +256,7 @@ def process_data_df(data: pd.DataFrame, nrows=None) -> pd.DataFrame:
         }
         df = pd.concat([df, pd.DataFrame(col_data)], axis=1)
 
+    # 带date列并且是单变量
     elif columns[0] == "date" and is_univariate:
         df["date"] = data.iloc[:, 0]
         df[cols_name[0]] = data.iloc[:, 1]
@@ -253,6 +264,7 @@ def process_data_df(data: pd.DataFrame, nrows=None) -> pd.DataFrame:
         df["date"] = pd.to_datetime(df["date"])
         df.set_index("date", inplace=True)
 
+    # 不带date列并且是单变量
     else:
         df[cols_name[0]] = data.iloc[:, 0]
 
@@ -262,12 +274,14 @@ def process_data_df(data: pd.DataFrame, nrows=None) -> pd.DataFrame:
         # Renaming the last column as "label"
         df.rename(columns={last_col_name: "label"}, inplace=True)
 
+    # 是否保留前nrows个时间点
     if nrows is not None and isinstance(nrows, int) and df.shape[0] >= nrows:
         df = df.iloc[:nrows, :]
 
     return df
 
 
+# 将时空数据转换为三维数据
 def process_data_np(df: pd.DataFrame, nrows=None) -> np.ndarray:
     """
     Convert spatial-temporal data from a DataFrame
@@ -295,6 +309,7 @@ def process_data_np(df: pd.DataFrame, nrows=None) -> np.ndarray:
     return data_np
 
 
+# 生成时间序列元数据
 def load_series_info(file_path: str) -> dict:
     """
     get series info

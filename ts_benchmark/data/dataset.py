@@ -3,6 +3,7 @@ from typing import Optional, Dict, NoReturn
 import pandas as pd
 
 
+# 保存时间序列数据、协变量和元数据
 class Dataset:
     """
     A class that stores data information and meta information
@@ -26,6 +27,7 @@ class Dataset:
         """
         return self._metadata
 
+    # 整体设置数据
     def set_data(
         self,
         data_dict: Optional[Dict[str, pd.DataFrame]] = None,
@@ -56,6 +58,7 @@ class Dataset:
         self._data_dict = new_data_dict
         self._covariate_dict = new_covariate_dict
 
+    # 整体设置前的校验钩子
     def _validate_data(
         self,
         data_dict: Dict[str, pd.DataFrame],
@@ -77,6 +80,7 @@ class Dataset:
         :return:
         """
 
+    # 增量加入或覆盖数据
     def update_data(
         self,
         inc_data_dict: Dict[str, pd.DataFrame],
@@ -92,6 +96,7 @@ class Dataset:
         self._data_dict.update(inc_data_dict)
         self._covariate_dict.update(inc_covariate_dict)
 
+    # 增量更新前的校验钩子
     def _validate_update_data(
         self,
         inc_data_dict: Dict[str, pd.DataFrame],
@@ -106,6 +111,7 @@ class Dataset:
         :param inc_covariate_dict: The incremental update of the covariates dictionary.
         """
 
+    # 清空全部内容
     def clear_data(self) -> NoReturn:
         """
         Clear all data stored in this dataset
@@ -114,6 +120,7 @@ class Dataset:
         self._data_dict = {}
         self._covariate_dict = {}
 
+    # 按名称获取序列
     def get_series(self, name: str) -> Optional[pd.DataFrame]:
         """
         Gets a single time series by name
@@ -124,6 +131,7 @@ class Dataset:
         """
         return self._data_dict.get(name, None)
 
+    # 按名称获取协变量
     def get_covariates(self, name: str) -> Optional[Dict]:
         """
         Gets covariates by time series' name.
@@ -134,6 +142,7 @@ class Dataset:
         """
         return self._covariate_dict.get(name, None)
 
+    # 获取单条序列的元信息
     def get_series_meta_info(self, name: str) -> Optional[pd.Series]:
         """
         Gets the meta information of time series by name
@@ -151,6 +160,7 @@ class Dataset:
             return None
         return self._metadata.loc[name]
 
+    # 判断序列是否已加载
     def has_series(self, name: str) -> bool:
         """
         Check if a series is available in the dataset
@@ -160,6 +170,7 @@ class Dataset:
         """
         return name in self._data_dict
 
+    # 判断已加载序列是否有元信息
     def has_series_meta_info(self, name: str) -> bool:
         """
         Check if the meta-info of a series is available in the dataset
@@ -174,6 +185,7 @@ class Dataset:
             and name in self._metadata.index
         )
 
+    # 导出当前状态
     def get_state(self) -> Dict:
         """
         Get a serializable state
@@ -187,6 +199,7 @@ class Dataset:
             "covariate_dict": self._covariate_dict,
         }
 
+    # 从状态恢复
     def set_state(self, state: Dict) -> NoReturn:
         """
         Restores from a serializable state

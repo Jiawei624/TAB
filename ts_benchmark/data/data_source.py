@@ -17,6 +17,7 @@ from ts_benchmark.data.utils import load_series_info, read_data, read_covariates
 logger = logging.getLogger(__name__)
 
 
+# 数据源的基础接口
 class DataSource:
     """
     A class that manages and reads from data sources
@@ -25,9 +26,10 @@ class DataSource:
     as well as detecting and updating data in the source storage.
     """
 
-    # The class for the internal dataset object
+    # 指定内存容器类型
     DATASET_CLASS = Dataset
 
+    # 创建一个Dataset对象并放入初始序列、协变量和元数据
     def __init__(
         self,
         data_dict: Optional[Dict[str, pd.DataFrame]] = None,
@@ -46,6 +48,7 @@ class DataSource:
         self._dataset = self.DATASET_CLASS()
         self._dataset.set_data(data_dict, covariate_dict, metadata)
 
+    # 将此容器暴露给调用方
     @property
     def dataset(self) -> Dataset:
         """
@@ -55,6 +58,7 @@ class DataSource:
         """
         return self._dataset
 
+    # 子类实现，从源中加载某些时序数据
     def load_series_list(self, series_list: List[str]) -> NoReturn:
         """
         Loads a list of time series from the source
@@ -68,18 +72,19 @@ class DataSource:
         )
 
 
+# 本地文件读取
 class LocalDataSource(DataSource):
     """
     The data source that manages data files in a local directory
     """
 
-    #: index column name of the metadata
+    # 元数据的索引列名
     _INDEX_COL = "file_name"
 
-    #: name of the data folder
+    # 数据文件夹名（存放具体csv文件的位置）
     _DATA_FOLDER_NAME = "data"
 
-    #: name of the covariates folder
+    # 协变量文件夹名
     _COVARIATES_FOLDER_NAME = "covariates"
 
     def __init__(self, local_dataset_path: str, metadata_file_name: str):
@@ -138,6 +143,7 @@ class LocalDataSource(DataSource):
         # )
         return metadata
 
+    # 加载时序数据列表
     def load_series_list(self, series_list: List[str]) -> NoReturn:
         logger.info("Start loading %s series in parallel", len(series_list))
         data_dict = {}
@@ -160,6 +166,7 @@ class LocalDataSource(DataSource):
         logger.info("Data loading finished.")
         self.dataset.update_data(data_dict, covariate_dict)
 
+    # 加载元数据
     def _load_metadata(self) -> pd.DataFrame:
         """
         Loads metadata from a local csv file
@@ -168,6 +175,7 @@ class LocalDataSource(DataSource):
         metadata.set_index(self._INDEX_COL, drop=False, inplace=True)
         return metadata
 
+    # 加载时序数据
     def _load_series(self, series_name: str) -> pd.DataFrame:
         """
         Loads a time series from a single data file
@@ -179,6 +187,7 @@ class LocalDataSource(DataSource):
         data = read_data(datafile_path)
         return data
 
+    # 加载协变量
     def _load_covariates(self, series_name: str) -> Optional[Dict]:
         """
         Loads a time series from a single data file
@@ -187,11 +196,14 @@ class LocalDataSource(DataSource):
         :return: A time series in DataFrame format.
         """
         series_name_without_extension = os.path.splitext(series_name)[0]
-        covariates_folder_path = os.path.join(self.local_covariates_path, series_name_without_extension)
+        covariates_folder_path = os.path.join(
+            self.local_covariates_path, series_name_without_extension
+        )
         covariates = read_covariates(covariates_folder_path)
         return covariates
 
 
+# 加载预测数据源
 class LocalForecastingDataSource(LocalDataSource):
     """
     The local data source of the forecasting task
@@ -201,6 +213,7 @@ class LocalForecastingDataSource(LocalDataSource):
         super().__init__(FORECASTING_DATASET_PATH, "FORECAST_META.csv")
 
 
+# 加载空间时间预测数据源
 class LocalStForecastingDataSource(LocalDataSource):
     """
     The local data source of the st_forecasting task
@@ -210,6 +223,7 @@ class LocalStForecastingDataSource(LocalDataSource):
         super().__init__(ST_FORECASTING_DATASET_PATH, "ST_FORECAST_META.csv")
 
 
+# 加载异常检测数据源
 class LocalAnomalyDetectDataSource(LocalDataSource):
     """
     The local data source of the anomaly detection task
