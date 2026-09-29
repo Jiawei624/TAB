@@ -68,6 +68,7 @@ class AnomalyDetect(Strategy):
             actual_label = test_label.to_numpy().flatten()
             end_inference_time = time.time()
 
+            # 逐组预测生成结果
             single_series_results_list = []
             for ratio, predict_label in predict_labels.items():
                 remaining_length = len(actual_label) - len(predict_label)
@@ -87,6 +88,7 @@ class AnomalyDetect(Strategy):
                         constant_values=0,
                     )
 
+                # 计算改组预测的全部配置指标
                 single_series_results, log_info = self.evaluator.evaluate_with_log(
                     actual=actual_label.astype(float),
                     predicted=predict_label.astype(float),
@@ -144,6 +146,7 @@ class AnomalyDetect(Strategy):
         ]
 
 
+# 按配置中的train_test_split比例划分
 class FixedDetectScore(AnomalyDetect):
     REQUIRED_FIELDS = ["train_test_split"]
 
@@ -170,6 +173,7 @@ class FixedDetectScore(AnomalyDetect):
         return classification_metrics_score.__all__
 
 
+# 按配置中的train_test_split比例划分
 class FixedDetectLabel(AnomalyDetect):
     REQUIRED_FIELDS = ["train_test_split"]
 
@@ -196,6 +200,7 @@ class FixedDetectLabel(AnomalyDetect):
         return classification_metrics_label.__all__
 
 
+# 按该序列元数据中的train_lens，取前段训练、后段测试
 class UnFixedDetectScore(AnomalyDetect):
     def split_data(self, series_name: str):
         data = DataPool().get_pool().get_series(series_name)
@@ -223,6 +228,7 @@ class UnFixedDetectScore(AnomalyDetect):
         return classification_metrics_score.__all__
 
 
+# 按该序列元数据中的train_lens，取前段训练、后段测试
 class UnFixedDetectLabel(AnomalyDetect):
     def split_data(self, series_name):
         data = DataPool().get_pool().get_series(series_name)
@@ -249,6 +255,7 @@ class UnFixedDetectLabel(AnomalyDetect):
         return classification_metrics_label.__all__
 
 
+# 整条序列同时用于训练和测试
 class AllDetectScore(AnomalyDetect):
     def split_data(self, series_name):
         data = DataPool().get_pool().get_series(series_name)
@@ -269,6 +276,7 @@ class AllDetectScore(AnomalyDetect):
         return classification_metrics_score.__all__
 
 
+# 整条序列同时用于训练和测试
 class AllDetectLabel(AnomalyDetect):
     def split_data(self, series_name):
         data = DataPool().get_pool().get_series(series_name)

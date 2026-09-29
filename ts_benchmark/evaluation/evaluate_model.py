@@ -18,6 +18,7 @@ from ts_benchmark.utils.parallel import ParallelBackend, TaskResult
 logger = logging.getLogger(__name__)
 
 
+# 取结果时的异常回退
 def _safe_execute(fn: Callable, args: Tuple, get_default_result: Callable):
     """
     make sure execution does not crash even if there are exceptions
@@ -29,6 +30,7 @@ def _safe_execute(fn: Callable, args: Tuple, get_default_result: Callable):
         return get_default_result(**{FieldNames.LOG_INFO: log})
 
 
+# 保存任务句柄，并在调用collect()时整理结果
 class EvalResult:
     """
     Result handle class for model evaluation.
@@ -53,7 +55,7 @@ class EvalResult:
         :param model_factory: The model factory instance of the current model.
         :param series_list: A list of strings representing data names.
         """
-        self.result_list = result_list
+        self.result_list = result_list  # 每条序列对应的TaskResult
         self.strategy = strategy
         self.model_factory = model_factory
         self.series_list = series_list
@@ -64,6 +66,7 @@ class EvalResult:
 
         :return: A generator of evaluation result DataFrames.
         """
+        # 创建结果收集器
         collector = self.strategy.get_collector()
         min_interval = (
             0 if len(self.result_list) < 100 else 0.1
@@ -99,6 +102,7 @@ class EvalResult:
             yield result_df
 
 
+# 配置并提交任务（模型工厂，序列列表，评测配置）
 def eval_model(
     model_factory: ModelFactory, series_list: list, evaluation_config: dict
 ) -> EvalResult:
@@ -128,7 +132,7 @@ def eval_model(
         for metric_info in metric
     ]
 
-    # Check if the evaluation indicators are legal
+    # 检查评估指标是否合法
     invalid_metrics = [
         m.get("name")
         for m in metric
@@ -141,10 +145,11 @@ def eval_model(
             )
         )
 
-    # Create an evaluator instance
+    # 创建一个评估实例
     evaluator = Evaluator(metric)
 
-    strategy = strategy_class(evaluation_config["strategy_args"], evaluator)  # 创建评估策略对象
+    # 创建评估策略对象
+    strategy = strategy_class(evaluation_config["strategy_args"], evaluator)
 
     eval_backend = ParallelBackend()
     result_list = []
@@ -152,13 +157,15 @@ def eval_model(
         series_list, desc=f"scheduling {model_factory.model_name}"
     ):
         # TODO: refactor data model to optimize communication cost in parallel mode
+        # 保存返回的任务句柄
         result_list.append(
             eval_backend.schedule(strategy.execute, (series_name, model_factory))
         )
-
+    # 返回结果句柄
     return EvalResult(strategy, result_list, model_factory, series_list)
 
 
+# 把记录变成可保存的表
 def build_result_df(
     result_list: List, model_factory: ModelFactory, strategy: Strategy
 ) -> pd.DataFrame:
