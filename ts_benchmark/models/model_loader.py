@@ -8,6 +8,7 @@ from ts_benchmark.baselines import ADAPTER
 logger = logging.getLogger(__name__)
 
 
+# 从路径中取出Python对象
 def _import_attribute(attr_path: str) -> Any:
     """
     import attribute according to a fully qualified path.
@@ -20,6 +21,7 @@ def _import_attribute(attr_path: str) -> Any:
     return getattr(package, name, None)
 
 
+# 检查模型信息的类型
 def import_model_info(model_path: str) -> Union[Dict, Callable]:
     """
     Import model information.
@@ -65,6 +67,7 @@ def import_model_info(model_path: str) -> Union[Dict, Callable]:
     return model_info
 
 
+# 搜索模型并应用适配器
 def get_model_info(model_config: Dict) -> Union[Dict, Callable]:
     """
     Obtain model information based on model configuration.
@@ -86,7 +89,11 @@ def get_model_info(model_config: Dict) -> Union[Dict, Callable]:
     :raises AttributeError: If the specified `model_name` cannot be found in the imported module.
     """
     model_name_candidates = [
-        model_config["model_name"][7:] if model_config["model_name"].startswith("global.") else None,
+        (
+            model_config["model_name"][7:]
+            if model_config["model_name"].startswith("global.")
+            else None
+        ),
         "ts_benchmark.baselines." + model_config["model_name"],
         model_config["model_name"],
     ]
@@ -113,6 +120,7 @@ def get_model_info(model_config: Dict) -> Union[Dict, Callable]:
     return model_info
 
 
+# 生成最终构造参数
 def get_model_hyper_params(
     recommend_model_hyper_params: Dict, required_hyper_params: Dict, model_config: Dict
 ) -> Dict:
@@ -136,6 +144,7 @@ def get_model_hyper_params(
     :return: The constructed model hyperparameter dictionary.
     :raises ValueError: If there are unfilled hyperparameters.
     """
+    # 先根据需要的超参数，从基准配置的推荐参数中取值，再用模型配置中的超参数进行覆盖或补充
     model_hyper_params = {
         arg_name: recommend_model_hyper_params[arg_std_name]
         for arg_name, arg_std_name in required_hyper_params.items()
@@ -148,6 +157,7 @@ def get_model_hyper_params(
     return model_hyper_params
 
 
+# 保存创建模型所需的信息
 class ModelFactory:
     """
     Model factory, the standard type to instantiate models in the pipeline.
@@ -179,6 +189,7 @@ class ModelFactory:
         return self.model_factory(**self.model_hyper_params)
 
 
+# 总装配函数
 def get_models(all_model_config: Dict) -> List[ModelFactory]:
     """
     Obtain a list of ModelFactory objects based on model configuration.
