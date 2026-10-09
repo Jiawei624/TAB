@@ -6,6 +6,7 @@ from .attn import AnomalyAttention, AttentionLayer
 from .embed import DataEmbedding, TokenEmbedding
 
 
+# 编码层
 class EncoderLayer(nn.Module):
     def __init__(self, attention, d_model, d_ff=None, dropout=0.1, activation="relu"):
         super(EncoderLayer, self).__init__()
@@ -28,6 +29,7 @@ class EncoderLayer(nn.Module):
         return self.norm2(x + y), attn, mask, sigma
 
 
+# 多层编码器
 class Encoder(nn.Module):
     def __init__(self, attn_layers, norm_layer=None):
         super(Encoder, self).__init__()
@@ -51,6 +53,7 @@ class Encoder(nn.Module):
         return x, series_list, prior_list, sigma_list
 
 
+# 整体模型
 class AnomalyTransformer_model(nn.Module):
     def __init__(
         self,
@@ -68,10 +71,10 @@ class AnomalyTransformer_model(nn.Module):
         super(AnomalyTransformer_model, self).__init__()
         self.output_attention = output_attention
 
-        # Encoding
+        # 嵌入层
         self.embedding = DataEmbedding(enc_in, d_model, dropout)
 
-        # Encoder
+        # 多层编码器
         self.encoder = Encoder(
             [
                 EncoderLayer(

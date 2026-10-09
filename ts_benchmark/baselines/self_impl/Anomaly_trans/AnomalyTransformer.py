@@ -26,11 +26,13 @@ DEFAULT_TRANSFORMER_BASED_HYPER_PARAMS = {
 }
 
 
+# 计算KL散度
 def my_kl_loss(p, q):
     res = p * (torch.log(p + 0.0001) - torch.log(q + 0.0001))
     return torch.mean(torch.sum(res, dim=-1), dim=1)
 
 
+# 调整学习率
 def adjust_learning_rate(optimizer, epoch, lr_):
     lr_adjust = {epoch: lr_ * (0.5 ** ((epoch - 1) // 1))}
     if epoch in lr_adjust.keys():
@@ -40,17 +42,18 @@ def adjust_learning_rate(optimizer, epoch, lr_):
         print("Updating learning rate to {}".format(lr))
 
 
+# 同时监控两个验证损失，保存检查点
 class EarlyStopping:
     def __init__(self, patience=7, verbose=False, dataset_name="", delta=0):
-        self.patience = patience
-        self.verbose = verbose
-        self.counter = 0
+        self.patience = patience  # 保存允许连续失败的次数
+        self.verbose = verbose  # 输出详细程度
+        self.counter = 0  # 连续未满足更新条件的次数
         self.best_score = None
         self.best_score2 = None
         self.early_stop = False
         self.val_loss_min = np.Inf
         self.val_loss2_min = np.Inf
-        self.delta = delta
+        self.delta = delta  # 更新检查点所要求的最小改善量
         self.dataset = dataset_name
 
     def __call__(self, val_loss, val_loss2, model):
@@ -80,6 +83,7 @@ class EarlyStopping:
         self.val_loss2_min = val_loss2
 
 
+# 构造配置对象
 class TransformerConfig:
     def __init__(self, **kwargs):
         for key, value in DEFAULT_TRANSFORMER_BASED_HYPER_PARAMS.items():
@@ -93,7 +97,7 @@ class AnomalyTransformer:
     def __init__(self, **kwargs):
         super(AnomalyTransformer, self).__init__()
         self.config = TransformerConfig(**kwargs)
-        self.scaler = StandardScaler()
+        self.scaler = StandardScaler()  # 标准化器
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.criterion = nn.MSELoss()
         self.win_size = self.config.win_size
@@ -113,6 +117,7 @@ class AnomalyTransformer:
         """
         return self.model_name
 
+    # 计算验证损失
     def vali(self, vali_loader):
         self.model.eval()
 
@@ -120,7 +125,7 @@ class AnomalyTransformer:
         loss_2 = []
         for i, (input_data, _) in enumerate(vali_loader):
             input = input_data.float().to(self.device)
-            output, series, prior, _ = self.model(input)
+            output, series, prior, _ = self.model(input)  # 前向传播
             series_loss = 0.0
             prior_loss = 0.0
             for u in range(len(prior)):
@@ -170,17 +175,23 @@ class AnomalyTransformer:
             prior_loss = prior_loss / len(prior)
 
             rec_loss = self.criterion(output, input)
-            loss_1.append((rec_loss - self.config.k * series_loss).item())
-            loss_2.append((rec_loss + self.config.k * prior_loss).item())
+            loss_1.append(
+                (rec_loss - self.config.k * series_loss).item()
+            )  # 推动S增大关联差异，让S尽量远离P，迫使模型寻找非近邻、长时间依赖
+            loss_2.append(
+                (rec_loss + self.config.k * prior_loss).item()
+            )  # 推动P减小关联差异，让P接近S，使P不至于成为一个没有意义的固定局部先验
 
         return np.average(loss_1), np.average(loss_2)
 
+    # 训练模型
     def detect_fit(self, train_data: pd.DataFrame, test_data: pd.DataFrame):
         """
         Train the model.
 
         :param train_data: Time series data used for training.
         """
+        # 变量数（此前TAB已经将label列取出）
         self.config.input_c = train_data.shape[1]
         self.config.output_c = train_data.shape[1]
 
@@ -297,8 +308,12 @@ class AnomalyTransformer:
                 rec_loss = self.criterion(output, input)
 
                 loss1_list.append((rec_loss - self.config.k * series_loss).item())
-                loss1 = rec_loss - self.config.k * series_loss
-                loss2 = rec_loss + self.config.k * prior_loss
+                loss1 = (
+                    rec_loss - self.config.k * series_loss
+                )  # 推动S增大关联差异，让S尽量远离P，迫使模型寻找非近邻、长时间依赖
+                loss2 = (
+                    rec_loss + self.config.k * prior_loss
+                )  # 推动P减小关联差异，让P接近S，使P不至于成为一个没有意义的固定局部先验
 
                 if (i + 1) % 100 == 0:
                     speed = (time.time() - time_now) / iter_count
