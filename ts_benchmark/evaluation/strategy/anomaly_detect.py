@@ -88,7 +88,7 @@ class AnomalyDetect(Strategy):
                         constant_values=0,
                     )
 
-                # 计算改组预测的全部配置指标
+                # 计算该组预测的全部配置指标
                 single_series_results, log_info = self.evaluator.evaluate_with_log(
                     actual=actual_label.astype(float),
                     predicted=predict_label.astype(float),

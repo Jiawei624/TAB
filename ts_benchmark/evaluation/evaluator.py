@@ -30,8 +30,8 @@ class Evaluator:
         :param metric: A list containing information on evaluation metrics.
         """
         self.metric = metric
-        self.metric_funcs = []
-        self.metric_names = []
+        self.metric_funcs = []  # 计算指标时实际调用的函数
+        self.metric_names = []  # 结果表列名
 
         # Create a list of evaluation indicator functions and names
         for metric_info in self.metric:
@@ -53,7 +53,7 @@ class Evaluator:
         actual: np.ndarray,
         predicted: np.ndarray,
         scaler: object = None,
-        hist_data: Union[np.ndarray,pd.DataFrame] = None,
+        hist_data: Union[np.ndarray, pd.DataFrame] = None,
         **kwargs,
     ) -> list:
         """
