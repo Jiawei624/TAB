@@ -214,14 +214,14 @@ class AnomalyTransformer:
             train_data_value,
             batch_size=self.config.batch_size,
             win_size=self.config.win_size,
-            step=1,
+            step=self.config.win_size,
             mode="train",
         )
         self.valid_loader = anomaly_detection_data_provider(
             valid_data,
             batch_size=self.config.batch_size,
             win_size=self.config.win_size,
-            step=1,
+            step=self.config.win_size,
             mode="val",
         )
 
@@ -351,7 +351,129 @@ class AnomalyTransformer:
                 break
             adjust_learning_rate(self.optimizer, epoch + 1, self.config.lr)
 
-    def detect_score(self, train: pd.DataFrame) -> np.ndarray:
+    def detect_score(self, test_data: pd.DataFrame) -> np.ndarray:
+        self.model.load_state_dict(self.early_stopping.check_point)
+        self.model.eval()
+
+        scaled_data = pd.DataFrame(
+            self.scaler.transform(test_data.values),
+            columns=test_data.columns,
+            index=test_data.index,
+        )
+        self.thre_loader = anomaly_detection_data_provider(
+            scaled_data,
+            batch_size=self.config.batch_size,
+            win_size=self.config.win_size,
+            step=self.config.win_size,
+            mode="thre",
+        )
+
+        criterion = nn.MSELoss(reduction="none")
+        temperature = 50
+        scores = []
+
+        with torch.no_grad():
+            for input_data, _ in self.thre_loader:
+                inputs = input_data.float().to(self.device)
+                outputs, series, prior, _ = self.model(inputs)
+
+                reconstruction_error = criterion(inputs, outputs).mean(dim=-1)
+
+                series_loss = 0.0
+                prior_loss = 0.0
+                for series_layer, prior_layer in zip(series, prior):
+                    normalized_prior = prior_layer / prior_layer.sum(
+                        dim=-1, keepdim=True
+                    )
+                    series_loss += (
+                        my_kl_loss(series_layer, normalized_prior) * temperature
+                    )
+                    prior_loss += (
+                        my_kl_loss(normalized_prior, series_layer) * temperature
+                    )
+
+                association_weight = torch.softmax(-series_loss - prior_loss, dim=-1)
+                scores.append((association_weight * reconstruction_error).cpu().numpy())
+
+        test_energy = np.concatenate(scores, axis=0).reshape(-1)
+        return test_energy, test_energy
+
+    def detect_label(self, test_data: pd.DataFrame):
+        self.model.load_state_dict(self.early_stopping.check_point)
+        self.model.eval()
+
+        # valid_loader.dataset.data 已在 detect_fit() 中用训练集统计量标准化
+        validation_loader = anomaly_detection_data_provider(
+            self.valid_loader.dataset.data,
+            batch_size=self.config.batch_size,
+            win_size=self.config.win_size,
+            step=self.config.win_size,
+            mode="thre",
+        )
+
+        scaled_test = pd.DataFrame(
+            self.scaler.transform(test_data.values),
+            columns=test_data.columns,
+            index=test_data.index,
+        )
+        self.thre_loader = anomaly_detection_data_provider(
+            scaled_test,
+            batch_size=self.config.batch_size,
+            win_size=self.config.win_size,
+            step=self.config.win_size,
+            mode="thre",
+        )
+
+        criterion = nn.MSELoss(reduction="none")
+        temperature = 50
+
+        def collect_energy(loader):
+            energies = []
+
+            with torch.no_grad():
+                for input_data, _ in loader:
+                    inputs = input_data.float().to(self.device)
+                    outputs, series, prior, _ = self.model(inputs)
+
+                    reconstruction_error = criterion(inputs, outputs).mean(dim=-1)
+
+                    series_loss = 0.0
+                    prior_loss = 0.0
+                    for series_layer, prior_layer in zip(series, prior):
+                        normalized_prior = prior_layer / prior_layer.sum(
+                            dim=-1, keepdim=True
+                        )
+                        series_loss += (
+                            my_kl_loss(series_layer, normalized_prior) * temperature
+                        )
+                        prior_loss += (
+                            my_kl_loss(normalized_prior, series_layer) * temperature
+                        )
+
+                    association_weight = torch.softmax(
+                        -series_loss - prior_loss, dim=-1
+                    )
+                    energies.append(
+                        (association_weight * reconstruction_error).cpu().numpy()
+                    )
+
+            return np.concatenate(energies, axis=0).reshape(-1)
+
+        val_energy = collect_energy(validation_loader)
+        test_energy = collect_energy(self.thre_loader)
+
+        ratios = self.config.anomaly_ratio
+        if not isinstance(ratios, (list, tuple)):
+            ratios = [ratios]
+
+        preds = {}
+        for ratio in ratios:
+            threshold = np.percentile(val_energy, 100 - ratio)
+            preds[ratio] = (test_energy > threshold).astype(int)
+
+        return preds, test_energy
+
+    """ def detect_score(self, train: pd.DataFrame) -> np.ndarray:
         self.model.load_state_dict(self.early_stopping.check_point)
         self.model.eval()
 
@@ -691,4 +813,4 @@ class AnomalyTransformer:
             threshold = np.percentile(combined_energy, 100 - ratio)
             preds[ratio] = (test_energy > threshold).astype(int)
 
-        return preds, test_energy
+        return preds, test_energy """

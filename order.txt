@@ -1,0 +1,43 @@
+nohup python ./scripts/run_benchmark.py \
+  --config-path unfixed_detect_label_multi_config.json \
+  --model-name self_impl.AnomalyTransformer \
+  --data-name-list SWAT.csv \
+  --model-hyper-params '{"batch_size":32,"lr":0.0001,"num_epochs":10,"win_size":100}' \
+  --seed 42 \
+  --gpus 0 \
+  --num-workers 1 \
+  --save-path label/AnomalyTransformer_SWaT_seed42 \
+  > ./log/at_swat_label_seed42.log 2>&1 &
+
+nohup python ./scripts/run_benchmark.py \
+  --config-path unfixed_detect_label_multi_config.json \
+  --model-name self_impl.AnomalyTransformer \
+  --data-name-list SWAT.csv \
+  --model-hyper-params '{"batch_size":64,"lr":0.001,"num_epochs":3,"win_size":100}' \
+  --seed 43 \
+  --gpus 1 \
+  --num-workers 1 \
+  --save-path label/AnomalyTransformer_SWaT_seed43 \
+  > ./log/at_swat_label_seed43.log 2>&1 &
+
+nohup python ./scripts/run_benchmark.py \
+  --config-path unfixed_detect_score_multi_config.json \
+  --model-name self_impl.AnomalyTransformer \
+  --data-name-list SWAT.csv \
+  --model-hyper-params '{"batch_size":64,"lr":0.001,"num_epochs":3,"win_size":100}' \
+  --seed 42 \
+  --gpus 0 \
+  --num-workers 1 \
+  --save-path score/AnomalyTransformer_SWaT_seed42 \
+  > ./log/at_swat_score_seed42.log 2>&1 &
+
+nohup python ./scripts/run_benchmark.py \
+  --config-path unfixed_detect_score_multi_config.json \
+  --model-name self_impl.AnomalyTransformer \
+  --data-name-list SWAT.csv \
+  --model-hyper-params '{"batch_size":64,"lr":0.001,"num_epochs":3,"win_size":100}' \
+  --seed 43 \
+  --gpus 1 \
+  --num-workers 1 \
+  --save-path score/AnomalyTransformer_SWaT_seed43 \
+  > ./log/at_swat_score_seed43.log 2>&1 &
