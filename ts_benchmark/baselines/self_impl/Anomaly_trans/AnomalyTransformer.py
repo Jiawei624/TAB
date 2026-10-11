@@ -214,14 +214,14 @@ class AnomalyTransformer:
             train_data_value,
             batch_size=self.config.batch_size,
             win_size=self.config.win_size,
-            step=self.config.win_size,
+            step=1,
             mode="train",
         )
         self.valid_loader = anomaly_detection_data_provider(
             valid_data,
             batch_size=self.config.batch_size,
             win_size=self.config.win_size,
-            step=self.config.win_size,
+            step=1,
             mode="val",
         )
 
