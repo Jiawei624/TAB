@@ -6,3 +6,5 @@ result/
 *.DS_Store
 venv/
 test/
+__pycache__/
+order.txt
