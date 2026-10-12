@@ -25,7 +25,7 @@
     },
     "report_config": {
         "aggregate_type": "mean",
-        "report_metrics": ["f_score"],
+        "report_metrics": ["f_score", "add"],
         "fill_type": "mean_value",
         "null_value_threshold": "0.3"
     }

@@ -30,7 +30,7 @@
 
     "report_config" : {
         "aggregate_type": "mean",
-        "report_metrics": ["affiliation_f"],
+        "report_metrics": ["affiliation_f", "add"],
         "fill_type": "mean_value",
         "null_value_threshold": "0.3"
     }

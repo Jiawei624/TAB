@@ -20,7 +20,7 @@ mase_norm (Normalized Mean Absolute Scaled Error) - 先变换真实值、预测�
 wape_norm (Normalized Weighted Absolute Percentage Error) - 在 scaler.transform 变换后的数据上计算 wape。
 msmape_norm (Normalized Modified Symmetric Mean Absolute Percentage Error) - 在 scaler.transform 变换后的数据上计算 msmape。
 
-二、classification_metrics_label.py（二值异常标签指标；15 个）
+二、classification_metrics_label.py（二值异常标签指标；16 个）
 
 accuracy (Accuracy) - 准确率；正确分类的时间点数／总时间点数。
 f_score (F1-score) - 异常类 F1 分数；异常类精确率与召回率的调和平均。
@@ -37,6 +37,7 @@ rf (Range F1-score) - 区间 F1 分数；区间精确率与区间召回率的调
 affiliation_f (Affiliation F1-score) - 先将连续异常点转为异常事件，再由事件关联精确率与召回率计算 F1。
 affiliation_precision (Affiliation Precision) - 基于预测异常事件与真实异常事件之间的关联关系计算精确率。
 affiliation_recall (Affiliation Recall) - 基于真实异常事件与预测异常事件之间的关联关系计算召回率。
+add (Average Sequence Detection Delay) - 平均序列检测延迟；对每个连续真实异常区间，取点调整前预测首次命中的位置减去区间起点，漏检时取区间长度，再对区间等权平均。单位为采样点，越小越好；无真实异常区间时返回 NaN。详见 docs/add_metric.md。
 
 三、classification_metrics_score.py（连续异常分数指标；6 个）
 

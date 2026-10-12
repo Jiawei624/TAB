@@ -24,10 +24,49 @@ __all__ = [
     "affiliation_f",
     "affiliation_precision",
     "affiliation_recall",
+    "add",
 ]
 
 
 metricor_grader = metricor()
+
+
+def add(actual: np.ndarray, predicted: np.ndarray, **kwargs) -> float:
+    """Average sequence detection delay in samples (lower is better).
+
+    For each contiguous anomalous span [begin, end), use the offset of the
+    first positive prediction, or end - begin if the span is missed. Average
+    over spans, giving every span equal weight. This follows MODEM's ADD
+    definition (Appendix B.3, Eq. 30) and its missed-span implementation.
+
+    Inputs must be aligned binary labels, before any point adjustment. Accept
+    one-dimensional or single-column arrays; reject scores and other shapes.
+    Return NaN when there are no anomalous spans (including empty inputs).
+    """
+    actual = np.asarray(actual)
+    predicted = np.asarray(predicted)
+    if actual.ndim == 2 and actual.shape[1] == 1:
+        actual = actual[:, 0]
+    if predicted.ndim == 2 and predicted.shape[1] == 1:
+        predicted = predicted[:, 0]
+    if actual.ndim != 1 or predicted.ndim != 1:
+        raise ValueError("ADD requires one-dimensional or single-column labels")
+    if actual.shape != predicted.shape:
+        raise ValueError("ADD requires actual and predicted labels of equal length")
+    if not np.isin(actual, [0, 1]).all() or not np.isin(predicted, [0, 1]).all():
+        raise ValueError("ADD requires binary labels (0 or 1), not anomaly scores")
+
+    edges = np.diff(np.r_[0, actual.astype(np.int8), 0])
+    starts = np.flatnonzero(edges == 1)
+    ends = np.flatnonzero(edges == -1)
+    if not len(starts):
+        return float("nan")
+
+    delays = []
+    for begin, end in zip(starts, ends):
+        hits = np.flatnonzero(predicted[begin:end])
+        delays.append(int(hits[0]) if len(hits) else int(end - begin))
+    return float(np.mean(delays))
 
 
 def adjust_predicts(actual: np.ndarray, predicted: np.ndarray, **kwargs) -> np.ndarray:

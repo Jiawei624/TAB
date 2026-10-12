@@ -89,6 +89,11 @@ We provide the experiment scripts for all benchmarks under the folder `./scripts
 sh ./scripts/CATCH.sh
 ```
 
+Label-based evaluations include Average Sequence Detection Delay (`add`, lower
+is better) in both the evaluation records and default reports. See
+[ADD definition and usage](docs/add_metric.md) for the MODEM-compatible delay
+policy, configuration examples, and verification command.
+
 
 
 ## FAQ
