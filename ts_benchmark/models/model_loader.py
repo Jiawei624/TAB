@@ -18,6 +18,9 @@ def _import_attribute(attr_path: str) -> Any:
     """
     package_name, name = attr_path.rsplit(".", 1)
     package = importlib.import_module(package_name)
+    if package_name == "ts_benchmark.baselines.self_impl" and name in package._MODELS:
+        # A prior submodule import may occupy a class alias (e.g. ModernTCN).
+        return package.load_baseline(name)
     return getattr(package, name, None)
 
 

@@ -103,11 +103,12 @@ class Evaluator:
         for m in self.metric_funcs:
             try:
                 evaluate_result.append(
-                    m(actual, predicted, scaler=scaler, hist_data=hist_data)
+                    m(actual, predicted, scaler=scaler, hist_data=hist_data, **kwargs)
                 )
             except Exception as e:
                 evaluate_result.append(np.nan)
-                log_info += f"Error in calculating {m.__name__}: {traceback.format_exc()}\n{e}\n"
+                name = getattr(m, "__name__", repr(m))
+                log_info += f"Error in calculating {name}: {traceback.format_exc()}\n{e}\n"
         return evaluate_result, log_info
 
     def default_result(self):

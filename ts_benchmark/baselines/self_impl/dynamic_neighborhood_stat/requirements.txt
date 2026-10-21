@@ -1,0 +1,12 @@
+# Main method plus TAB's existing score/label runner (other baselines are not needed).
+numpy>=1.23.5,<3
+pandas>=1.5
+torch>=2.0
+scikit-learn>=1.2
+scipy>=1.9
+statsmodels>=0.14
+tqdm>=4.64
+ray>=2.6.3
+# TAB's original run_benchmark.py imports its CSV and Dash reporting modules.
+dash>=2.9.3
+dash-bootstrap-components>=1.5

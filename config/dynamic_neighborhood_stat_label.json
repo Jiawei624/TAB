@@ -1,0 +1,17 @@
+{
+  "data_config": {
+    "feature_dict": {"if_univariate": false},
+    "data_set_name": "large_detect"
+  },
+  "model_config": {"models": [], "recommend_model_hyper_params": {}},
+  "evaluation_config": {
+    "metrics": ["precision", "recall", "f_score", "fpr", "add"],
+    "strategy_args": {"strategy_name": "unfixed_detect_label", "seed": 42}
+  },
+  "report_config": {
+    "aggregate_type": "mean",
+    "report_metrics": ["precision", "recall", "f_score", "fpr", "add"],
+    "fill_type": "mean_value",
+    "null_value_threshold": 0.0
+  }
+}

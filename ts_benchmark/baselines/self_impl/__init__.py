@@ -1,3 +1,7 @@
+"""Load only the requested baseline and its dependencies."""
+
+from importlib import import_module
+
 __all__ = [
     "VAR_model",
     "LOF",
@@ -17,24 +21,45 @@ __all__ = [
     "ContraAD",
     "CATCH",
     "CrossAD",
+    "DynamicNeighborhoodStat",
 ]
 
-from ts_benchmark.baselines.self_impl.LOF.lof import LOF
-from ts_benchmark.baselines.self_impl.VAR.VAR import VAR_model
-from ts_benchmark.baselines.self_impl.DCdetector.DCdetector import DCdetector
-from ts_benchmark.baselines.self_impl.Anomaly_trans.AnomalyTransformer import AnomalyTransformer
-from ts_benchmark.baselines.self_impl.ModernTCN.ModernTCN import ModernTCN
-from ts_benchmark.baselines.self_impl.DualTF.DualTF import DualTF
-from ts_benchmark.baselines.self_impl.TFAD.TFAD import TFAD
-from ts_benchmark.baselines.self_impl.MatrixProfile.MatrixProfile import MatrixProfile
-from ts_benchmark.baselines.self_impl.TranAD.TranAD import TranAD
-from ts_benchmark.baselines.self_impl.LeftSTAMPi.LeftSTAMPi import LeftSTAMPi
-from ts_benchmark.baselines.self_impl.KMeans.KMeans import KMeans
-from ts_benchmark.baselines.self_impl.DWT_MLEAD.DWTMLEAD import DWT_MLEAD
-from ts_benchmark.baselines.self_impl.SAND.SAND import SAND
-from ts_benchmark.baselines.self_impl.torsk.torsk import Torsk
-from ts_benchmark.baselines.self_impl.eif.eif import EIF
-from ts_benchmark.baselines.self_impl.ContraAD.ContraAD import ContraAD
-from ts_benchmark.baselines.self_impl.Series2Graph.Series2Graph import Series2Graph
-from ts_benchmark.baselines.self_impl.CATCH.CATCH import CATCH
-from ts_benchmark.baselines.self_impl.CrossAD.CrossAD import CrossAD
+_MODELS = {
+    "LOF": ("LOF.lof", "LOF"),
+    "VAR_model": ("VAR.VAR", "VAR_model"),
+    "DCdetector": ("DCdetector.DCdetector", "DCdetector"),
+    "AnomalyTransformer": ("Anomaly_trans.AnomalyTransformer", "AnomalyTransformer"),
+    "ModernTCN": ("ModernTCN.ModernTCN", "ModernTCN"),
+    "DualTF": ("DualTF.DualTF", "DualTF"),
+    "TFAD": ("TFAD.TFAD", "TFAD"),
+    "MatrixProfile": ("MatrixProfile.MatrixProfile", "MatrixProfile"),
+    "TranAD": ("TranAD.TranAD", "TranAD"),
+    "LeftSTAMPi": ("LeftSTAMPi.LeftSTAMPi", "LeftSTAMPi"),
+    "KMeans": ("KMeans.KMeans", "KMeans"),
+    "DWT_MLEAD": ("DWT_MLEAD.DWTMLEAD", "DWT_MLEAD"),
+    "SAND": ("SAND.SAND", "SAND"),
+    "Torsk": ("torsk.torsk", "Torsk"),
+    "EIF": ("eif.eif", "EIF"),
+    "ContraAD": ("ContraAD.ContraAD", "ContraAD"),
+    "Series2Graph": ("Series2Graph.Series2Graph", "Series2Graph"),
+    "CATCH": ("CATCH.CATCH", "CATCH"),
+    "CrossAD": ("CrossAD.CrossAD", "CrossAD"),
+    "DynamicNeighborhoodStat": ("dynamic_neighborhood_stat.DynamicNeighborhoodStat", "DynamicNeighborhoodStat"),
+}
+
+
+def load_baseline(name):
+    if name not in _MODELS:
+        raise AttributeError("module {!r} has no attribute {!r}".format(__name__, name))
+    module, attribute = _MODELS[name]
+    value = getattr(import_module("{}.{}".format(__name__, module)), attribute)
+    globals()[name] = value
+    return value
+
+
+def __getattr__(name):
+    return load_baseline(name)
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_MODELS))

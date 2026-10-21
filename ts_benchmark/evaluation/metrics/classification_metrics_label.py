@@ -25,6 +25,7 @@ __all__ = [
     "affiliation_precision",
     "affiliation_recall",
     "add",
+    "fpr",
 ]
 
 
@@ -43,6 +44,12 @@ def add(actual: np.ndarray, predicted: np.ndarray, **kwargs) -> float:
     one-dimensional or single-column arrays; reject scores and other shapes.
     Return NaN when there are no anomalous spans (including empty inputs).
     """
+    # Existing callers retain the original policy. Opt-in causal detectors pass
+    # full arrays and a valid mask so cropping cannot invent a new event start.
+    valid_mask = kwargs.get("valid_mask")
+    if valid_mask is not None:
+        actual = kwargs["full_actual"]
+        predicted = kwargs["full_predicted"]
     actual = np.asarray(actual)
     predicted = np.asarray(predicted)
     if actual.ndim == 2 and actual.shape[1] == 1:
@@ -55,6 +62,10 @@ def add(actual: np.ndarray, predicted: np.ndarray, **kwargs) -> float:
         raise ValueError("ADD requires actual and predicted labels of equal length")
     if not np.isin(actual, [0, 1]).all() or not np.isin(predicted, [0, 1]).all():
         raise ValueError("ADD requires binary labels (0 or 1), not anomaly scores")
+    if valid_mask is not None:
+        valid_mask = np.asarray(valid_mask, dtype=bool)
+        if valid_mask.shape != actual.shape:
+            raise ValueError("ADD valid mask must match the original label timeline")
 
     edges = np.diff(np.r_[0, actual.astype(np.int8), 0])
     starts = np.flatnonzero(edges == 1)
@@ -64,9 +75,21 @@ def add(actual: np.ndarray, predicted: np.ndarray, **kwargs) -> float:
 
     delays = []
     for begin, end in zip(starts, ends):
+        if valid_mask is not None and (
+            begin == 0 or end == len(actual) or not valid_mask[begin:end].all()
+        ):
+            continue
         hits = np.flatnonzero(predicted[begin:end])
         delays.append(int(hits[0]) if len(hits) else int(end - begin))
-    return float(np.mean(delays))
+    return float(np.mean(delays)) if delays else float("nan")
+
+
+def fpr(actual: np.ndarray, predicted: np.ndarray, **kwargs) -> float:
+    """False alarms per actually normal point, before point adjustment."""
+    normal = np.asarray(actual) == 0
+    if not np.any(normal):
+        return float("nan")
+    return float(np.mean(np.asarray(predicted)[normal] == 1))
 
 
 def adjust_predicts(actual: np.ndarray, predicted: np.ndarray, **kwargs) -> np.ndarray:
@@ -143,24 +166,15 @@ def adjust_accuracy(actual: np.ndarray, predicted: np.ndarray, **kwargs):
 
 
 def precision(actual: np.ndarray, predicted: np.ndarray, **kwargs):
-    Precision, Recall, F, Support = metrics.precision_recall_fscore_support(
-        actual, predicted, zero_division=0
-    )
-    return Precision[1]
+    return metrics.precision_score(actual, predicted, pos_label=1, zero_division=0)
 
 
 def recall(actual: np.ndarray, predicted: np.ndarray, **kwargs):
-    Precision, Recall, F, Support = metrics.precision_recall_fscore_support(
-        actual, predicted, zero_division=0
-    )
-    return Recall[1]
+    return metrics.recall_score(actual, predicted, pos_label=1, zero_division=0)
 
 
 def f_score(actual: np.ndarray, predicted: np.ndarray, **kwargs):
-    Precision, Recall, F, Support = metrics.precision_recall_fscore_support(
-        actual, predicted, zero_division=0
-    )
-    return F[1]
+    return metrics.f1_score(actual, predicted, pos_label=1, zero_division=0)
 
 
 def accuracy(actual: np.ndarray, predicted: np.ndarray, **kwargs):

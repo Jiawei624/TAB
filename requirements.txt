@@ -18,7 +18,7 @@ nimfa==1.4.0
 PyWavelets>=1.1.1
 combo
 tensorflow
-torch>=1.11.0
+torch>=2.0
 salesforce-merlion
 timm
 transformers

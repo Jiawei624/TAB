@@ -94,6 +94,11 @@ is better) in both the evaluation records and default reports. See
 [ADD definition and usage](docs/add_metric.md) for the MODEM-compatible delay
 policy, configuration examples, and verification command.
 
+The `DynamicNeighborhoodStat` baseline implements dynamic multiscale neighborhood
+reconstruction and causal fluctuation-statistic prediction. See
+[configuration and server commands](docs/dynamic_neighborhood_stat.md) for normal-only
+training and evaluation through TAB's existing score and label strategies.
+
 
 
 ## FAQ
