@@ -2,6 +2,7 @@
 import base64
 import pickle
 import json
+import logging
 import time
 import traceback
 from pathlib import Path
@@ -19,6 +20,8 @@ from ts_benchmark.evaluation.strategy.strategy import Strategy
 from ts_benchmark.models import ModelFactory
 from ts_benchmark.utils.data_processing import split_before
 from ts_benchmark.utils.random_utils import fix_all_random_seed
+
+logger = logging.getLogger(__name__)
 
 
 class AnomalyDetect(Strategy):
@@ -139,6 +142,7 @@ class AnomalyDetect(Strategy):
                 ]
                 single_series_results_list.append(single_series_results)
         except Exception as e:
+            logger.exception("Anomaly detection failed for %s", series_name)
             # log = f"{traceback.format_exc()}\n{e}"
             log = f"The error series is: {series_name}\n{traceback.format_exc()}\n{e}"
             single_series_results_list = [

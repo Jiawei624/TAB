@@ -7,6 +7,8 @@ import contextlib
 import io
 import importlib.util
 import json
+import logging
+import runpy
 import sys
 import tempfile
 import unittest
@@ -231,7 +233,20 @@ class TabLifecycleChecks(unittest.TestCase):
                 self.assertEqual(frame.loc[0, "log_info"], "", frame.loc[0, "log_info"])
                 return frame, result.strategy.model
 
-            labels, fitted = evaluate("label")
+            # The real TAB strategy disables cuDNN in its seed helper. All of this
+            # model's train/validation/calibration/test forwards must override it.
+            cudnn_states = []
+            original_forward = DualPathNetwork.forward
+
+            def record_runtime(network, windows):
+                cudnn_states.append(torch.backends.cudnn.enabled)
+                return original_forward(network, windows)
+
+            with patch.object(DualPathNetwork, "forward", record_runtime):
+                labels, fitted = evaluate("label")
+            self.assertTrue(cudnn_states)
+            self.assertTrue(all(cudnn_states))
+            self.assertFalse(torch.backends.cudnn.enabled)  # restore TAB's inherited setting
             self.assertEqual(fitted.best_epoch_, 1)
             self.assertEqual(fitted.model.observations.win_size, 64)
             calibration = json.loads((fitted.run_dir_ / "calibration.json").read_text())
@@ -240,6 +255,15 @@ class TabLifecycleChecks(unittest.TestCase):
             self.assertEqual(calibration["split_metadata"]["validation"]["window_count"], 9)
             self.assertEqual(np.asarray(calibration["freeze_energy"]["margin"]).shape, (3, 2))
             predictions = pd.read_csv(fitted.run_dir_ / "test_predictions.csv")
+            progress = json.loads((fitted.run_dir_ / "runtime_progress.json").read_text())
+            self.assertIn("test inference", progress["stage"])
+            self.assertEqual(progress["status"], "completed")
+            environment = json.loads((fitted.run_dir_ / "runtime_environment.json").read_text())
+            self.assertFalse(environment["inherited_cudnn_enabled"])
+            self.assertTrue(environment["model_cudnn_enabled"])
+            history = pd.read_csv(fitted.run_dir_ / "training_history.csv")
+            self.assertGreater(history.loc[0, "train_seconds"], 0)
+            self.assertGreater(history.loc[0, "validation_seconds"], 0)
             self.assertTrue(predictions["score"].iloc[:63].isna().all())
             self.assertTrue(np.isfinite(predictions["score"].iloc[63:]).all())
             actual = data["label"].to_numpy()[360:]
@@ -304,13 +328,33 @@ class TabLifecycleChecks(unittest.TestCase):
             self.assertTrue((coverage["valid_start"] == 63).all())
             self.assertTrue((coverage["valid_end_exclusive"] == 170).all())
             self.assertTrue((coverage["complete_events"] == 1).all())
+            # Exercise the user's original CLI, including CSV loading and report
+            # generation, against the same tiny fixture and calibrated checkpoint.
+            from ts_benchmark.pipeline import PREDEFINED_DATASETS
+            entry_output = runtime / "original_entry"
+            entry_args = [str(ROOT / "scripts/run_benchmark.py"), "--config-path", "dynamic_neighborhood_stat_label.json",
+                          "--model-name", "self_impl.DynamicNeighborhoodStat", "--data-name-list", "synthetic.csv",
+                          "--model-hyper-params", json.dumps(parameters), "--seed", "42", "--gpus", "0",
+                          "--num-workers", "1", "--timeout", "-1", "--save-path", str(entry_output)]
+            with patch.object(PREDEFINED_DATASETS["large_detect"], "datasrc_class", lambda: LocalDataSource(str(fixture), "META.csv")), \
+                 patch.object(DynamicNeighborhoodStat, "_train", side_effect=AssertionError("original entry unexpectedly retrained")), \
+                 patch.object(sys, "argv", entry_args), patch.object(logging, "basicConfig"), \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                runpy.run_path(str(ROOT / "scripts/run_benchmark.py"), run_name="__main__")
+            entry_reports = list(entry_output.glob("test_report*"))
+            self.assertEqual(len(entry_reports), 1)
+            entry_report = pd.read_csv(entry_reports[0])
+            self.assertEqual(set(entry_report["metric_name"]), {"precision", "recall", "f_score", "fpr", "add"})
+            self.assertTrue(np.isfinite(entry_report.drop(columns=["metric_name", "strategy_args"]).to_numpy(dtype=float)).all())
             # Rejected training data must remain attributable and must not turn into imputed results.
             invalid = data.copy()
             invalid.loc[0, "label"] = 1
             pool.get_series.return_value = invalid
             DataPool().set_pool(pool)
             strategy = UnFixedDetectLabel({"strategy_name": "unfixed_detect_label", "seed": 42}, Evaluator([{"name": "f_score"}]))
-            failed = pd.DataFrame(strategy.execute("synthetic.csv", factory), columns=strategy.field_names)
+            with self.assertLogs("ts_benchmark.evaluation.strategy.anomaly_detect", level="ERROR") as error_log:
+                failed = pd.DataFrame(strategy.execute("synthetic.csv", factory), columns=strategy.field_names)
+            self.assertIn("Anomaly detection failed", error_log.output[0])
             self.assertEqual(failed.loc[0, "file_name"], "synthetic.csv")
             self.assertIn("clean normal", failed.loc[0, "log_info"])
             _, _, failed_summary = launcher.summarize([(failed, "label", 42, ["f_score"])], {})

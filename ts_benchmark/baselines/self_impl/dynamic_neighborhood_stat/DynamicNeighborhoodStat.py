@@ -5,6 +5,8 @@ import json
 import logging
 import random
 import re
+import shutil
+import time
 import uuid
 from pathlib import Path
 
@@ -17,6 +19,7 @@ from ts_benchmark.common.constant import ROOT_PATH
 from .config import Config
 from .features import training_references
 from .model import DualPathNetwork
+from .progress import StageProgress
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +131,27 @@ class DynamicNeighborhoodStat:
                           shuffle=training, drop_last=False, num_workers=self.config.num_workers,
                           pin_memory=self.device_.type == "cuda", generator=generator)
 
+    def _progress(self, stage, total):
+        return StageProgress("{} seed={} {}".format(self.series_name_, self.config.seed, stage), total,
+                             self.config.log_interval_seconds, self.run_dir_ / "runtime_progress.json")
+
+    def _log_runtime(self):
+        runtime = {"torch": torch.__version__, "device": str(self.device_), "cuda_available": torch.cuda.is_available(),
+                   "cudnn_available": torch.backends.cudnn.is_available(),
+                   "inherited_cudnn_enabled": torch.backends.cudnn.enabled,
+                   "model_cudnn_enabled": True, "cudnn_deterministic": True, "cudnn_benchmark": False,
+                   "cpu_threads": torch.get_num_threads(), "channels": len(self.columns_),
+                   "batch_size": self.config.batch_size, "win_size": self.config.win_size,
+                   "target_chunk_size": self.config.target_chunk_size,
+                   "gradient_checkpointing": self.config.gradient_checkpointing,
+                   "num_workers": self.config.num_workers}
+        if self.device_.type == "cuda":
+            runtime["gpu"] = torch.cuda.get_device_name(self.device_)
+        logger.info("%s runtime: %s; artifacts=%s", self.series_name_, json.dumps(runtime), self.run_dir_)
+        if self.config.device == "auto" and self.device_.type == "cpu":
+            logger.warning("device=auto selected CPU; use device=cuda:0 to require GPU instead of silently falling back")
+        _json(self.run_dir_ / "runtime_environment.json", runtime)
+
     def detect_fit(self, train_data, train_label=None):
         self._prediction_cache = None
         values = self._values(train_data)
@@ -158,6 +182,7 @@ class DynamicNeighborhoodStat:
         self.checkpoint_path_ = self.run_dir_ / "checkpoint.pt"
         self.evaluation_artifact_dir_ = str(self.run_dir_)
         self.device_ = self._device()
+        self._log_runtime()
         if self.config.reuse_checkpoint and self.checkpoint_path_.is_file():
             self._load(self.checkpoint_path_, expected_fingerprint=self.train_fingerprint_)
             # Refresh derived metadata even for checkpoints saved before these fields existed.
@@ -180,7 +205,8 @@ class DynamicNeighborhoodStat:
         train = (raw_train - self.mean_) / self.scale_
         validation = (values[split:] - self.mean_) / self.scale_
         logger.info("%s: computing full training references (%d train, %d validation observations)", self.series_name_, len(train), len(validation))
-        self.references_ = training_references(train, self.config)
+        with self._progress("training references", values.shape[1] * (len(self.config.spans) + 1)) as progress:
+            self.references_ = training_references(train, self.config, progress=progress.update)
         self.model = DualPathNetwork(values.shape[1], self.config, self.references_).to(self.device_)
         self.training_history_ = self._train(train, validation)
         self._calibrate(validation)
@@ -188,14 +214,18 @@ class DynamicNeighborhoodStat:
         self.save(self.checkpoint_path_)
         pd.DataFrame(self.training_history_).to_csv(self.run_dir_ / "training_history.csv", index=False)
         self._write_calibration(len(train), len(validation))
+        logger.info("Fit and calibration completed: %s", self.checkpoint_path_)
         return self
 
-    def _epoch(self, loader, optimizer=None):
+    # TAB's fix_all_random_seed() disables cuDNN globally. Scope this override to
+    # this model, including backward, while preserving deterministic convolutions.
+    @torch.backends.cudnn.flags(enabled=True, benchmark=False, deterministic=True)
+    def _epoch(self, loader, optimizer=None, stage=None):
         training = optimizer is not None
         self.model.train(training)
         totals, count = {}, 0
-        with torch.set_grad_enabled(training):
-            for windows in loader:
+        with torch.set_grad_enabled(training), self._progress(stage or ("train" if training else "validation"), len(loader)) as progress:
+            for batch_index, windows in enumerate(loader, 1):
                 windows = windows.to(self.device_, non_blocking=True)
                 if training:
                     optimizer.zero_grad(set_to_none=True)
@@ -215,20 +245,30 @@ class DynamicNeighborhoodStat:
                 for name, value in row.items():
                     totals[name] = totals.get(name, 0.0) + value * len(windows)
                 count += len(windows)
+                progress.update(batch_index, "windows={} loss={:.6g}".format(count, row["loss"]))
         return {name: value / count for name, value in totals.items()}
 
     def _train(self, train, validation):
         train_loader, validation_loader = self._loader(train, True), self._loader(validation)
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.config.learning_rate, weight_decay=self.config.weight_decay)
         best, best_state, waiting, history = float("inf"), None, 0, []
+        logger.info("%s: %d training batches + %d validation batches per epoch, maximum %d epochs",
+                    self.series_name_, len(train_loader), len(validation_loader), self.config.num_epochs)
         for epoch in range(1, self.config.num_epochs + 1):
-            train_metrics = self._epoch(train_loader, optimizer)
-            validation_metrics = self._epoch(validation_loader)
+            started = time.perf_counter()
+            train_metrics = self._epoch(train_loader, optimizer, "epoch {}/{} train".format(epoch, self.config.num_epochs))
+            train_seconds = time.perf_counter() - started
+            started = time.perf_counter()
+            validation_metrics = self._epoch(validation_loader, stage="epoch {}/{} validation".format(epoch, self.config.num_epochs))
+            validation_seconds = time.perf_counter() - started
             history.append(dict(epoch=epoch, **{"train_" + k: v for k, v in train_metrics.items()},
-                                **{"validation_" + k: v for k, v in validation_metrics.items()}))
+                                **{"validation_" + k: v for k, v in validation_metrics.items()},
+                                train_seconds=train_seconds, validation_seconds=validation_seconds))
+            pd.DataFrame(history).to_csv(self.run_dir_ / "training_history.csv", index=False)
             monitored = validation_metrics["reconstruction"]
-            logger.info("%s seed=%d epoch=%d train=%.6g validation=%.6g concentration=%.4f", self.series_name_,
-                        self.config.seed, epoch, train_metrics["loss"], monitored, validation_metrics["concentration_mean"])
+            logger.info("%s seed=%d epoch=%d train=%.6g validation=%.6g concentration=%.4f train_seconds=%.1f validation_seconds=%.1f", self.series_name_,
+                        self.config.seed, epoch, train_metrics["loss"], monitored, validation_metrics["concentration_mean"],
+                        train_seconds, validation_seconds)
             if monitored < best - self.config.min_delta:
                 best, waiting = monitored, 0
                 best_state = {name: value.detach().cpu().clone() for name, value in self.model.state_dict().items()}
@@ -257,19 +297,29 @@ class DynamicNeighborhoodStat:
         score = maximum + np.log(np.exp(self.config.beta * (variable - maximum[..., None])).mean(axis=-1)) / self.config.beta
         return score, variable
 
+    @torch.backends.cudnn.flags(enabled=True, benchmark=False, deterministic=True)
     def _calibrate(self, validation):
         """Fixed network -> support -> error quantiles -> full-score quantile."""
         count, channels = len(validation) - self.config.win_size + 1, len(self.columns_)
         coordinates = 2 * len(self.config.scales) + 3 * len(self.config.spans) + 1
+        required_bytes = count * channels * (coordinates + 1) * np.dtype(np.float64).itemsize
+        free_bytes = shutil.disk_usage(self.run_dir_).free
+        logger.info("%s: calibration cache=%.3f GiB, free disk=%.3f GiB, directory=%s",
+                    self.series_name_, required_bytes / 2**30, free_bytes / 2**30, self.run_dir_)
+        if free_bytes < required_bytes:
+            raise OSError("Calibration requires {} bytes of temporary disk space, only {} are free in {}".format(
+                required_bytes, free_bytes, self.run_dir_))
         token = uuid.uuid4().hex
         errors_path, c_path = self.run_dir_ / (".errors_" + token), self.run_dir_ / (".concentration_" + token)
-        errors = np.memmap(errors_path, dtype=np.float64, mode="w+", shape=(count, channels, coordinates))
-        concentrations = np.memmap(c_path, dtype=np.float64, mode="w+", shape=(count, channels))
+        errors = concentrations = None
         model_error, mean_error, message_sum, offset = np.zeros(channels), np.zeros(channels), np.zeros(2), 0
         self.model.eval()
         try:
-            with torch.no_grad():
-                for windows in self._loader(validation):
+            errors = np.memmap(errors_path, dtype=np.float64, mode="w+", shape=(count, channels, coordinates))
+            concentrations = np.memmap(c_path, dtype=np.float64, mode="w+", shape=(count, channels))
+            loader = self._loader(validation)
+            with torch.no_grad(), self._progress("calibration residuals", len(loader)) as progress:
+                for batch_index, windows in enumerate(loader, 1):
                     windows = windows.to(self.device_, non_blocking=True)
                     output = self.model(windows)
                     residual_errors = self.model.errors(windows, output)
@@ -282,23 +332,30 @@ class DynamicNeighborhoodStat:
                     mean_error += ((output["target_n"] - self.model.mean_n).square() / normalizer).mean(dim=(-2, -1)).sum(dim=0).cpu().numpy()
                     message_sum += output["message_diagnostics"].sum(dim=(0, 1)).cpu().numpy()
                     offset = stop
+                    progress.update(batch_index, "windows={}".format(offset))
             self.support_model_error_, self.support_mean_error_ = model_error / count, mean_error / count
             self.support_gain_ = (self.support_mean_error_ - self.support_model_error_) / np.maximum(self.support_mean_error_, self.config.epsilon_g)
             self.support_ = (self.support_mean_error_ > self.config.epsilon_g) & (self.support_gain_ >= self.config.eta_g)
             # Each quantile is exact; only a single coordinate is copied to RAM at a time.
             q = np.empty((channels, coordinates))
-            for i in range(channels):
-                for k in range(coordinates):
-                    q[i, k] = max(float(np.quantile(errors[:, i, k], self.config.zeta_error)), self.config.epsilon_q)
+            with self._progress("calibration error quantiles", channels * coordinates) as progress:
+                for i in range(channels):
+                    for k in range(coordinates):
+                        q[i, k] = max(float(np.quantile(errors[:, i, k], self.config.zeta_error)), self.config.epsilon_q)
+                        progress.update(i * coordinates + k + 1, "variable={}/{}".format(i + 1, channels))
             n_end = 2 * len(self.config.scales)
             self.q_n_ = q[:, :n_end].reshape(channels, len(self.config.scales), 2)
             self.q_s_ = q[:, n_end:-1].reshape(channels, len(self.config.spans), 3)
             self.q_p_ = q[:, -1]
             validation_scores = np.empty(count, dtype=np.float64)
-            for start in range(0, count, self.config.reference_chunk_size):
-                stop = min(start + self.config.reference_chunk_size, count)
-                validation_scores[start:stop], _ = self._score_errors(errors[start:stop])
-            self.threshold_ = float(np.quantile(validation_scores, self.config.zeta_threshold))
+            with self._progress("calibration scores and threshold", count) as progress:
+                for start in range(0, count, self.config.reference_chunk_size):
+                    stop = min(start + self.config.reference_chunk_size, count)
+                    validation_scores[start:stop], _ = self._score_errors(errors[start:stop])
+                    if stop < count:
+                        progress.update(stop)
+                self.threshold_ = float(np.quantile(validation_scores, self.config.zeta_threshold))
+                progress.update(count, "threshold={:.6g} support={}/{}".format(self.threshold_, int(self.support_.sum()), channels))
             self.calibration_diagnostics_ = {
                 "concentration_quantiles": np.quantile(concentrations, [0.5, 0.9, 0.95, 0.99]).tolist(),
                 "concentration_exceed_fraction": float(np.mean(concentrations > self.model.rho_a)),
@@ -309,10 +366,10 @@ class DynamicNeighborhoodStat:
             }
         finally:
             # Delete only the two explicitly created files; close mappings first for Windows.
-            errors._mmap.close()
-            concentrations._mmap.close()
-            errors_path.unlink()
-            c_path.unlink()
+            for mapping, path in ((errors, errors_path), (concentrations, c_path)):
+                if mapping is not None:
+                    mapping._mmap.close()
+                path.unlink(missing_ok=True)
 
     def freeze_energy_diagnostics(self):
         """Theoretical raw A-error bounds, not alarm or overall-score guarantees."""
@@ -395,8 +452,10 @@ class DynamicNeighborhoodStat:
         detector.device_, detector.run_dir_, detector.checkpoint_path_ = detector._device(), path.parent, path
         detector.evaluation_artifact_dir_ = str(path.parent)
         detector._load(path)
+        detector._log_runtime()
         return detector
 
+    @torch.backends.cudnn.flags(enabled=True, benchmark=False, deterministic=True)
     def _predict(self, test_data):
         if self.model is None or not hasattr(self, "threshold_"):
             raise RuntimeError("Call detect_fit or load a calibrated checkpoint first")
@@ -407,6 +466,7 @@ class DynamicNeighborhoodStat:
             raise ValueError("The test segment must contain at least win_size observations")
         key = _fingerprint(values, self.columns_)
         if self._prediction_cache is not None and self._prediction_cache[0] == key:
+            logger.info("%s: reusing cached test scores", self.series_name_)
             return self._prediction_cache[1].copy()
         normalized = (values - self.mean_) / self.scale_
         scores = np.full(len(values), np.nan, dtype=np.float64)
@@ -420,8 +480,9 @@ class DynamicNeighborhoodStat:
         c_sum, c_exceed, c_excess, c_count = 0.0, 0.0, 0.0, 0
         self.model.eval()
         try:
-            with torch.no_grad():
-                for windows in self._loader(normalized):
+            loader = self._loader(normalized)
+            with torch.no_grad(), self._progress("test inference", len(loader)) as progress:
+                for batch_index, windows in enumerate(loader, 1):
                     windows = windows.to(self.device_, non_blocking=True)
                     output = self.model(windows)
                     batch_scores, variable_scores = self._score_errors(self._pack_errors(self.model.errors(windows, output)))
@@ -435,6 +496,7 @@ class DynamicNeighborhoodStat:
                     c_excess += float(torch.relu(c - self.model.rho_a).sum())
                     c_count += c.numel()
                     offset = stop
+                    progress.update(batch_index, "scored={}/{}".format(offset - self.config.win_size + 1, len(loader.dataset)))
         finally:
             if variable is not None:
                 variable.flush()
@@ -454,6 +516,7 @@ class DynamicNeighborhoodStat:
             "concentration_mean_excess": c_excess / c_count,
         })
         self._prediction_cache = (key, scores.copy())
+        logger.info("%s: test predictions saved to %s", self.series_name_, self.run_dir_ / "test_predictions.csv")
         return scores
 
     def detect_score(self, test_data):

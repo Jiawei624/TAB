@@ -81,7 +81,7 @@ def _coarse_moments(series, config):
     return mean, m2 / seen
 
 
-def training_references(values, config):
+def training_references(values, config, progress=None):
     """Full-data exact quantiles with O(N) temporary memory per coordinate.
 
     values is the standardized TRAIN portion, never validation or test data.
@@ -102,6 +102,8 @@ def training_references(values, config):
     for i in range(channels):
         series = values[:, i]
         refs["mean_n"][i], refs["variance_n"][i] = _coarse_moments(series, config)
+        if progress is not None:
+            progress(i * (len(spans) + 1) + 1, "variable={}/{} coarse targets".format(i + 1, channels))
         for index, h in enumerate(spans):
             u = np.linspace(-1, 1, h, dtype=np.float64)
             moments = np.empty((count, 3), dtype=np.float64)
@@ -123,6 +125,9 @@ def training_references(values, config):
             refs["variance_s"][i, index] = targets.var(axis=0, ddof=0)
             refs["a_low"][i, index], refs["a_high"][i, index] = np.quantile(
                 targets[:, 0], [config.zeta_a, 1 - config.zeta_a])
+            if progress is not None:
+                progress(i * (len(spans) + 1) + index + 2,
+                         "variable={}/{} statistics span={}".format(i + 1, channels, h))
     refs["fixed_s"] = refs["variance_s"] <= config.epsilon_v
     refs["fixed_values_s"] = refs["mean_s"].copy()
     refs["fixed_values_s"][..., 0] = np.clip(

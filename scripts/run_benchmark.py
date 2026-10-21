@@ -242,7 +242,7 @@ if __name__ == "__main__":
         type=int,
         nargs="+",
         default=None,
-        help="List of gpu devices to use, only available in ray backends",
+        help="Visible GPU devices for sequential or ray evaluation",
     )
 
     # 指定Ray后端创建worker的数量

@@ -44,6 +44,7 @@ class Config:
     target_chunk_size: int = 16
     gradient_checkpointing: bool = True
     reference_chunk_size: int = 8192
+    log_interval_seconds: float = 30.0
     seed: int = 42
     device: str = "auto"
     artifact_dir: str = "result/DynamicNeighborhoodStat/artifacts"
@@ -74,7 +75,7 @@ class Config:
         for name in positive:
             if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError("{} must be finite and positive".format(name))
-        for name in ("lambda_a", "weight_decay", "min_delta", "sample_interval_seconds"):
+        for name in ("lambda_a", "weight_decay", "min_delta", "sample_interval_seconds", "log_interval_seconds"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
                 raise ValueError("{} must be finite and nonnegative".format(name))
 
@@ -93,5 +94,5 @@ class Config:
         """Runtime placement/output choices do not change the fitted detector."""
         ignored = {"device", "artifact_dir", "reuse_checkpoint", "save_variable_scores",
                    "num_workers", "target_chunk_size", "gradient_checkpointing",
-                   "reference_chunk_size", "sample_interval_seconds"}
+                   "reference_chunk_size", "sample_interval_seconds", "log_interval_seconds"}
         return {key: value for key, value in self.to_dict().items() if key not in ignored}

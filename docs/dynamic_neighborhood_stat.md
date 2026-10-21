@@ -62,6 +62,48 @@ python scripts/run_benchmark.py --config-path dynamic_neighborhood_stat_score.js
 
 默认可复用已有校准检查点。训练数据内容、列顺序、种子或模型配置变化后会使用不同目录。多种子脚本的 `--retrain` 会重新训练每个种子的第一个入口，第二个入口继续加载该次训练的检查点。
 
+## 运行进度与故障定位
+
+`run_benchmark.py` 默认使用 sequential 后端。指定 `--seed 42` 只运行该种子；`--num-workers 1` 是评价 worker 设置，与模型的 DataLoader `num_workers=0` 不同。sequential 后端不实施任务超时。
+
+TAB 的 `fix_all_random_seed()` 将全局 `torch.backends.cudnn.enabled` 设为 false。DynamicNeighborhoodStat 在训练、验证、校准和推理期间使用 `enabled=True, deterministic=True, benchmark=False` 的局部 cuDNN 上下文，包含反向传播，退出后恢复调用方设置。CUDA 张量仍需可用的 CUDA 版 PyTorch 和 cuDNN；关闭 cuDNN 本身不会把模型移到 CPU。
+
+默认每 30 秒在完成批次后输出阶段进度，同时记录首批和末批。日志包含批次数、耗时、批次速度及当前阶段的预计剩余时间。训练历史每轮落盘。参考统计、校准残差、校准分位数及测试推理都有各自的进度。若单个批次尚未完成，进度也不会更新；此时可依据上一条阶段记录检查服务器资源。
+
+建议在服务器上明确要求 GPU，并关闭 Python 标准输出缓冲：
+
+```bash
+mkdir -p log
+nohup uv run python -u ./scripts/run_benchmark.py \
+  --config-path dynamic_neighborhood_stat_label.json \
+  --model-name self_impl.DynamicNeighborhoodStat \
+  --data-name-list SWAT.csv \
+  --model-hyper-params '{"batch_size":32,"learning_rate":0.001,"win_size":128,"num_epochs":50,"patience":7,"device":"cuda:0","log_interval_seconds":30}' \
+  --seed 42 --gpus 0 --num-workers 1 --timeout -1 \
+  --save-path label/DynamicNeighborhoodStat_SWaT_seed42 \
+  > ./log/dynamic_neighborhood_stat_swat_label_seed42.log 2>&1 &
+```
+
+启动日志会打印实际设备、GPU 名称、cuDNN 设置及 artifact 目录。`device=cuda:0` 在 CUDA 不可用时明确报错；`auto` 可以回退到 CPU。模型目录中的 `runtime_environment.json` 保存运行环境，`runtime_progress.json` 保存最近完成的工作及更新时间。`log_interval_seconds=0` 可输出每一步进度，该值不改变检查点身份。评价异常同时打印完整 traceback 并保留在 TAB 的 `log_info` 中。
+
+SWAT 在默认配置下每轮包含 12,372 个训练批次和 3,090 个验证批次。一条 `epoch=1` 汇总表示第一轮训练和验证均已完成；下一条整轮汇总需要等待第二轮的全部批次。阶段日志中的 ETA 根据当前实测速率计算。
+
+仅用几批 51 变量的合成窗口检查服务器速度和设备：
+
+```bash
+uv run python -u validation/profile_dynamic_neighborhood_stat.py --channels 51 --steps 3 --device cuda:0
+```
+
+脚本保留默认 L=128 和 batch size=32，分别测量启用和关闭梯度重计算时的前向、反向耗时。添加 `--disable-cudnn --output result/DynamicNeighborhoodStat/diagnosis/profile_no_cudnn.json` 可测量 cuDNN 关闭时的速度。这里的整轮耗时外推仅用于诊断，不代表完整训练结果。
+
+真实 SWAT 的少量连续点可用于两轮流程测试：
+
+```bash
+uv run python -u validation/smoke_dynamic_neighborhood_stat.py --device cuda:0
+```
+
+该测试默认读取 3 个变量，取官方正常训练段内 800 点和官方测试段前 192 点，覆盖独立构窗、两轮训练、校准、推理及检查点重载；结果写入 `result/DynamicNeighborhoodStat/diagnosis/swat_smoke/`。小样本不用于评价检测效果。完整检查记录见 [运行检查报告](dynamic_neighborhood_stat_runtime_audit.md)。
+
 ## 主配置
 
 | 项目 | 默认值 |
@@ -130,6 +172,7 @@ python scripts/run_dynamic_neighborhood_stat.py --data-name-list SWAT.csv --seed
 
 - `checkpoint.pt`：完整模型、训练统计、列顺序、支持标志、校准尺度和阈值，可直接加载。
 - `training_history.csv`、`calibration.json`：训练/验证损失、集中度、最佳轮数、参数量、独立构窗边界、冻结能量误差下界及完整校准数据。
+- `runtime_environment.json`、`runtime_progress.json`：设备与计算库设置，以及当前阶段的已完成数量、速度和 ETA。训练历史额外包含各轮训练与验证耗时。
 - `test_predictions.csv`：位置、输入索引、有效掩码、整体分数及报警。
 - `test_variable_scores.npy`：逐变量分数，默认磁盘存储，可用 `np.load(path, mmap_mode="r")` 读取。
 - `test_events.csv`、`evaluation_label.json`、`evaluation_score.json`：评价侧生成的事件和指标记录，测试标签不传入模型。
