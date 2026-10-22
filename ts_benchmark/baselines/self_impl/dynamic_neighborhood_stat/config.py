@@ -1,7 +1,8 @@
 """The complete main-method configuration (no ablation modes)."""
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from typing import List, Optional, Union
 
 
 @dataclass
@@ -33,6 +34,8 @@ class Config:
     eta_g: float = 0.05
     zeta_error: float = 0.95
     zeta_threshold: float = 0.99
+    anomaly_ratio: Optional[Union[float, List[float]]] = field(
+        default_factory=lambda: [0.1, 0.5, 1.0, 2, 3, 5.0, 10.0, 15, 20, 25])
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     num_epochs: int = 50
@@ -45,6 +48,15 @@ class Config:
     gradient_checkpointing: bool = True
     factorized_routing: bool = True
     prune_tcn: bool = True
+    efficient_context: bool = True
+    pack_scales: bool = False
+    cache_static_projections: bool = True
+    feature_cache: str = "none"
+    device_scoring: bool = True
+    skip_unsupported_targets: bool = True
+    inference_diagnostics: bool = False
+    prefetch_factor: int = 2
+    persistent_workers: bool = True
     reference_chunk_size: int = 8192
     log_interval_seconds: float = 30.0
     seed: int = 42
@@ -57,7 +69,7 @@ class Config:
     def __post_init__(self):
         integers = ("win_size", "hidden_n", "hidden_s", "context_dim", "message_dim",
                     "embedding_dim", "mlp_hidden", "num_epochs", "patience", "batch_size",
-                    "target_chunk_size", "reference_chunk_size")
+                    "target_chunk_size", "reference_chunk_size", "prefetch_factor")
         for name in integers:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -66,9 +78,21 @@ class Config:
             raise ValueError("win_size must be a multiple of 32 and at least 64")
         if not isinstance(self.num_workers, int) or self.num_workers < 0:
             raise ValueError("num_workers must be a nonnegative integer")
-        for name in ("factorized_routing", "prune_tcn"):
+        for name in ("factorized_routing", "prune_tcn", "efficient_context", "pack_scales",
+                     "cache_static_projections", "device_scoring", "skip_unsupported_targets",
+                     "inference_diagnostics", "persistent_workers"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError("{} must be boolean".format(name))
+        if self.feature_cache not in ("none", "memory", "disk"):
+            raise ValueError("feature_cache must be none, memory, or disk")
+        if self.anomaly_ratio is not None:
+            ratios = self.anomaly_ratio if isinstance(self.anomaly_ratio, (list, tuple)) else [self.anomaly_ratio]
+            if not ratios or any(isinstance(ratio, bool) or not isinstance(ratio, (int, float))
+                                 or not math.isfinite(ratio) or not 0 < ratio < 100 for ratio in ratios):
+                raise ValueError("anomaly_ratio must contain finite percentages strictly between 0 and 100")
+            if len(set(ratios)) != len(ratios):
+                raise ValueError("anomaly_ratio must not contain duplicates")
+            self.anomaly_ratio = [float(ratio) for ratio in ratios]
         for name in ("train_ratio", "chi", "alpha", "eta_g", "zeta_error", "zeta_threshold"):
             if not 0 < getattr(self, name) < 1:
                 raise ValueError("{} must lie in (0, 1)".format(name))
@@ -100,5 +124,8 @@ class Config:
         ignored = {"device", "artifact_dir", "reuse_checkpoint", "save_variable_scores",
                    "num_workers", "target_chunk_size", "gradient_checkpointing",
                    "reference_chunk_size", "sample_interval_seconds", "log_interval_seconds",
-                   "factorized_routing", "prune_tcn"}
+                   "factorized_routing", "prune_tcn", "efficient_context", "pack_scales",
+                   "cache_static_projections", "feature_cache", "device_scoring",
+                   "skip_unsupported_targets", "inference_diagnostics", "prefetch_factor",
+                   "persistent_workers", "anomaly_ratio"}
         return {key: value for key, value in self.to_dict().items() if key not in ignored}

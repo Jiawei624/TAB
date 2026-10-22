@@ -78,6 +78,7 @@ class AnomalyDetect(Strategy):
 
             # 逐组预测生成结果
             single_series_results_list = []
+            masked_evaluations = []
             for ratio, predict_label in predict_labels.items():
                 valid_mask = getattr(model, "evaluation_valid_mask_", None)
                 metric_context = {}
@@ -117,8 +118,13 @@ class AnomalyDetect(Strategy):
                 )
                 artifact_dir = getattr(model, "evaluation_artifact_dir_", None)
                 if artifact_dir is not None and valid_mask is not None:
-                    self.evaluation_metadata_ = self._save_masked_evaluation(
-                        artifact_dir, actual_label, predict_label, valid_mask, single_series_results, log_info)
+                    info, events = self._masked_evaluation(
+                        actual_label, predict_label, valid_mask, single_series_results, log_info)
+                    info["typical_anomaly_ratio"] = ratio
+                    thresholds = getattr(model, "label_thresholds_", {})
+                    if ratio in thresholds:
+                        info["threshold"] = thresholds[ratio]
+                    masked_evaluations.append((info, events))
                 print(single_series_results)
 
                 inference_data = [predict_label, another]
@@ -141,6 +147,8 @@ class AnomalyDetect(Strategy):
                     log_info,
                 ]
                 single_series_results_list.append(single_series_results)
+            if masked_evaluations:
+                self.evaluation_metadata_ = self._save_masked_evaluations(artifact_dir, masked_evaluations)
         except Exception as e:
             logger.exception("Anomaly detection failed for %s", series_name)
             # log = f"{traceback.format_exc()}\n{e}"
@@ -150,11 +158,9 @@ class AnomalyDetect(Strategy):
             ]
         return single_series_results_list
 
-    def _save_masked_evaluation(self, directory, actual, predicted, valid_mask, results, log_info):
+    def _masked_evaluation(self, actual, predicted, valid_mask, results, log_info):
         """Labels stay in the evaluator; model training/inference never receives test labels."""
-        directory = Path(directory)
         label_mode = "add" in self.accepted_metrics()
-        mode = "label" if label_mode else "score"
         positions = np.flatnonzero(valid_mask)
         info = {"index_basis": "zero_based_test_segment", "test_length": len(actual),
                 "valid_start": int(positions[0]), "valid_end_exclusive": int(positions[-1] + 1),
@@ -168,15 +174,33 @@ class AnomalyDetect(Strategy):
         info["total_events"] = len(spans)
         info["complete_events"] = int(sum(eligibility))
         info["excluded_boundary_events"] = len(spans) - info["complete_events"]
+        rows = []
         if label_mode:
-            rows = []
             for (begin, end), eligible in zip(spans, eligibility):
                 hits = np.flatnonzero((predicted[begin:end] == 1) & valid_mask[begin:end])
                 rows.append({"begin": int(begin), "end_exclusive": int(end), "length": int(end - begin),
                              "eligible_for_add": eligible, "detected": bool(len(hits)),
                              "first_hit": int(begin + hits[0]) if len(hits) else None,
                              "delay_samples": int(hits[0]) if eligible and len(hits) else int(end - begin) if eligible else None})
-            columns = ["begin", "end_exclusive", "length", "eligible_for_add", "detected", "first_hit", "delay_samples"]
+        return info, rows
+
+    def _save_masked_evaluations(self, directory, evaluations):
+        """Keep every ratio's metrics and events while sharing coverage metadata."""
+        directory = Path(directory)
+        label_mode = "add" in self.accepted_metrics()
+        mode = "label" if label_mode else "score"
+        group_fields = ("typical_anomaly_ratio", "threshold", "metrics", "log_info")
+        info = dict(evaluations[0][0])
+        if len(evaluations) > 1:
+            info = {key: value for key, value in info.items() if key not in group_fields}
+            info["groups"] = [{key: value for key, value in group.items() if key in group_fields}
+                              for group, _ in evaluations]
+        if label_mode:
+            rows = [dict(event, typical_anomaly_ratio=group["typical_anomaly_ratio"],
+                         threshold=group.get("threshold"))
+                    for group, events in evaluations for event in events]
+            columns = ["typical_anomaly_ratio", "threshold", "begin", "end_exclusive", "length",
+                       "eligible_for_add", "detected", "first_hit", "delay_samples"]
             pd.DataFrame(rows, columns=columns).to_csv(directory / "test_events.csv", index=False)
         with (directory / ("evaluation_" + mode + ".json")).open("w", encoding="utf-8") as stream:
             json.dump(info, stream, ensure_ascii=False, indent=2, allow_nan=False)

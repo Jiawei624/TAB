@@ -37,20 +37,25 @@ def summarize(records, groups):
     for record in records:
         frame, mode, seed, metrics = record
         for _, row in frame.iterrows():
+            ratio = row.get("typical_anomaly_ratio", "None")
+            ratio = "None" if pd.isna(ratio) else str(ratio)
             for metric in metrics:
                 rows.append({"entity": row["file_name"], "dataset": groups.get(row["file_name"], Path(row["file_name"]).stem),
-                             "mode": mode, "seed": seed, "metric": metric, "value": row[metric],
+                             "mode": mode, "typical_anomaly_ratio": ratio,
+                             "seed": seed, "metric": metric, "value": row[metric],
                              "failed": bool(str(row["log_info"] or "")),
                              **{field: row.get(field, np.nan) for field in COVERAGE_FIELDS}})
     long = pd.DataFrame(rows)
     seed_rows = []
-    for (dataset, mode, seed, metric), group in long.groupby(["dataset", "mode", "seed", "metric"], sort=False):
+    for (dataset, mode, ratio, seed, metric), group in long.groupby(
+            ["dataset", "mode", "typical_anomaly_ratio", "seed", "metric"], sort=False):
         finite = np.isfinite(group["value"].to_numpy(dtype=float))
         complete = bool(finite.all() and not group["failed"].any())
         counts = {}
         for field in COUNT_FIELDS:
             counts[field] = float(group[field].sum()) if group[field].notna().all() else np.nan
-        seed_rows.append({"dataset": dataset, "mode": mode, "seed": seed, "metric": metric,
+        seed_rows.append({"dataset": dataset, "mode": mode, "typical_anomaly_ratio": ratio,
+                          "seed": seed, "metric": metric,
                           "value": float(group["value"].mean()) if complete else np.nan,
                           "expected_entities": len(group), "finite_entities": int(finite.sum()),
                           "failed_entities": int(group["failed"].sum()), **counts})
@@ -61,7 +66,7 @@ def summarize(records, groups):
     for field in COUNT_FIELDS:
         aggregation[field + "_min"] = (field, "min")
         aggregation[field + "_max"] = (field, "max")
-    summary = by_seed.groupby(["dataset", "mode", "metric"], sort=False).agg(**aggregation).reset_index()
+    summary = by_seed.groupby(["dataset", "mode", "typical_anomaly_ratio", "metric"], sort=False).agg(**aggregation).reset_index()
     return long, by_seed, summary
 
 
@@ -124,20 +129,22 @@ def main(argv=None):
                     for field in COVERAGE_FIELDS:
                         frame[field] = metadata.get(field, np.nan)
                     directory = output / "records" / Path(name).stem / ("seed_" + str(seed)) / mode
-                    log_files.append(save_log(frame, str(directory), "DynamicNeighborhoodStat"))
-                    records.append((frame, mode, seed, evaluation["metrics"]))
+                    log_files.append(save_log(frame, str(directory), "DynamicNeighborhoodStat",
+                                              compress_method=evaluation.get("record_compression", "gz")))
+                    records.append((frame, mode, seed, result.strategy.evaluator.metric_names))
     finally:
         backend.close(force=True)
     long, by_seed, summary = summarize(records, groups)
     long.to_csv(output / "per_entity_metrics.csv", index=False)
-    coverage = long[["entity", "dataset", "mode", "seed", "failed"] + list(COVERAGE_FIELDS)].drop_duplicates(
-        subset=["entity", "dataset", "mode", "seed"])
+    coverage = long[["entity", "dataset", "mode", "typical_anomaly_ratio", "seed", "failed"] + list(COVERAGE_FIELDS)].drop_duplicates(
+        subset=["entity", "dataset", "mode", "typical_anomaly_ratio", "seed"])
     coverage.to_csv(output / "evaluation_coverage.csv", index=False)
     by_seed.to_csv(output / "per_seed_metrics.csv", index=False)
     summary.to_csv(output / "summary.csv", index=False)
     pd.concat([frame.assign(mode=mode, seed=seed) for frame, mode, seed, _ in records], ignore_index=True).to_csv(output / "all_records.csv", index=False)
     (output / "run_manifest.json").write_text(json.dumps({"arguments": vars(args), "parameters": parameters,
         "records": log_files, "summary_std_ddof": 1, "entity_aggregation": "equal_weight_within_seed",
+        "ratio_aggregation": "separate_metrics_and_coverage_for_each_anomaly_ratio",
         "coverage_aggregation": "entity_counts_summed_within_seed; min_max_across_seeds; unknown_counts_remain_nan",
         "missing_values": "not_imputed; incomplete_entity_groups_have_nan_seed_metric"}, indent=2), encoding="utf-8")
     print(summary.to_string(index=False))

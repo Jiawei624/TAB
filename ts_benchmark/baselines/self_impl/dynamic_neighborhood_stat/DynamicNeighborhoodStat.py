@@ -1,13 +1,16 @@
 """TAB adapter, normal-only training, sequential calibration and persistence."""
 
 import hashlib
+from contextlib import ExitStack, contextmanager
 import json
 import logging
+import math
 import random
 import re
 import shutil
 import time
 import uuid
+import weakref
 from pathlib import Path
 
 import numpy as np
@@ -18,19 +21,30 @@ from torch.utils.data import BatchSampler, DataLoader, Dataset, RandomSampler, S
 from ts_benchmark.common.constant import ROOT_PATH
 from .config import Config
 from .features import training_references
+from .feature_cache import FeatureCache
 from .model import DualPathNetwork
 from .progress import StageProgress
 
 logger = logging.getLogger(__name__)
 
 
+class EpochRandomSampler(RandomSampler):
+    def __iter__(self):
+        # The original nonpersistent DataLoader consumed one base-seed draw
+        # before each epoch's permutation, using the SAME generator. Keep that
+        # sequence even when persistent workers no longer draw a new base seed.
+        torch.empty((), dtype=torch.int64).random_(generator=self.generator)
+        return super().__iter__()
+
+
 class WindowDataset(Dataset):
-    def __init__(self, values, length):
+    def __init__(self, values, length, features=None):
         if length <= 0 or len(values) < length:
             raise ValueError("A window must fit entirely inside its input segment")
         # Normalize the layout once, rather than copying each overlapping window.
         self.values, self.length = np.ascontiguousarray(values), length
         self.offsets = np.arange(length)
+        self.features = features
 
     def __len__(self):
         return len(self.values) - self.length + 1
@@ -43,13 +57,18 @@ class WindowDataset(Dataset):
             if indices.min() < 0 or indices.max() >= len(self):
                 raise IndexError("Window index is outside its input segment")
             # One contiguous batch allocation; no per-window copy followed by stack.
-            return torch.from_numpy(self.values[indices[:, None] + self.offsets[None]])
+            windows = torch.from_numpy(self.values[indices[:, None] + self.offsets[None]])
+            return windows if self.features is None else {"windows": windows, "features": self.features.gather(indices)}
         if index < 0 or index >= len(self):
             raise IndexError("Window index is outside its input segment")
         window = self.values[index:index + self.length]
         if len(window) != self.length:
             raise RuntimeError("A window crossed the boundary of its input segment")
-        return window
+        if self.features is None:
+            return window
+        features = self.features.gather(np.asarray([index]))
+        return {"windows": torch.from_numpy(window), "features": {
+            "coarse": tuple(value[0] for value in features["coarse"]), "statistics": features["statistics"][0]}}
 
 
 def window_split_metadata(train_length, validation_length, window_length):
@@ -100,6 +119,8 @@ class DynamicNeighborhoodStat:
         self.model = None
         self.series_name_ = "series"
         self._prediction_cache = None
+        self._feature_caches = {}
+        self._loaders = weakref.WeakSet()
 
     @staticmethod
     def required_hyper_params():
@@ -137,12 +158,65 @@ class DynamicNeighborhoodStat:
 
     def _loader(self, values, training=False):
         generator = torch.Generator().manual_seed(self.config.seed)
-        dataset = WindowDataset(values, self.config.win_size)
-        sampler = RandomSampler(dataset, generator=generator) if training else SequentialSampler(dataset)
+        dataset = WindowDataset(values, self.config.win_size, self._feature_caches.get(id(values)))
+        sampler = EpochRandomSampler(dataset, generator=generator) if training else SequentialSampler(dataset)
         batches = BatchSampler(sampler, self.config.batch_size, drop_last=False)
         # Passing whole batches through the sampler disables per-item collate/stack.
-        return DataLoader(dataset, batch_size=None, sampler=batches, num_workers=self.config.num_workers,
-                          pin_memory=self.device_.type == "cuda", generator=generator)
+        worker_options = {"prefetch_factor": self.config.prefetch_factor,
+                          "persistent_workers": self.config.persistent_workers} if self.config.num_workers else {}
+        loader = DataLoader(dataset, batch_size=None, sampler=batches, num_workers=self.config.num_workers,
+                            pin_memory=self.device_.type == "cuda",
+                            generator=torch.Generator().manual_seed(self.config.seed), **worker_options)
+        self._loaders.add(loader)
+        return loader
+
+    @contextmanager
+    def _feature_cache(self, values, stage, neighborhood=True):
+        if self.config.feature_cache == "none":
+            yield
+            return
+        cache = FeatureCache(values, self.config, self.references_["energy_floor"], self.run_dir_, neighborhood)
+        started = time.perf_counter()
+        try:
+            logger.info("%s: %s observation cache=%.3f GiB, mode=%s", self.series_name_, stage,
+                        cache.size_bytes / 2**30, cache.mode)
+            with self._progress(stage + " observation cache", cache.total_work) as progress:
+                cache.build(values, progress=progress.update)
+            logger.info("%s: %s observation cache built in %.3fs", self.series_name_, stage, time.perf_counter() - started)
+            self._feature_caches[id(values)] = cache
+            yield
+        finally:
+            self._feature_caches.pop(id(values), None)
+            # Windows workers must release their mappings before cache files are removed.
+            for loader in list(self._loaders):
+                if loader.dataset.features is cache:
+                    iterator = getattr(loader, "_iterator", None)
+                    if iterator is not None:
+                        iterator._shutdown_workers()
+                        loader._iterator = None
+            cache.close()
+
+    def _prepare_batch(self, batch):
+        if isinstance(batch, torch.Tensor):
+            return batch.to(self.device_, non_blocking=True), None
+        features = batch["features"]
+        return batch["windows"].to(self.device_, non_blocking=True), {
+            "coarse": tuple(value.to(self.device_, non_blocking=True) for value in features["coarse"]),
+            "statistics": features["statistics"].to(self.device_, non_blocking=True)}
+
+    @contextmanager
+    def _batches(self, loader):
+        iterator = iter(loader)
+        try:
+            yield enumerate(iterator, 1)
+        finally:
+            # A failed batch can leave a nonpersistent iterator referenced by
+            # its traceback; stop its workers before closing disk cache files.
+            if loader.num_workers and not loader.persistent_workers:
+                iterator._shutdown_workers()
+
+    def _forward_batch(self, windows, features):
+        return self.model(windows) if features is None else self.model.forward_cached(windows, features)
 
     def _progress(self, stage, total):
         return StageProgress("{} seed={} {}".format(self.series_name_, self.config.seed, stage), total,
@@ -158,7 +232,13 @@ class DynamicNeighborhoodStat:
                    "target_chunk_size": self.config.target_chunk_size,
                    "gradient_checkpointing": self.config.gradient_checkpointing,
                    "factorized_routing": self.config.factorized_routing, "prune_tcn": self.config.prune_tcn,
-                   "num_workers": self.config.num_workers}
+                   "efficient_context": self.config.efficient_context, "pack_scales": self.config.pack_scales,
+                   "feature_cache": self.config.feature_cache, "device_scoring": self.config.device_scoring,
+                   "skip_unsupported_targets": self.config.skip_unsupported_targets,
+                   "inference_diagnostics": self.config.inference_diagnostics,
+                   "cache_static_projections": self.config.cache_static_projections,
+                   "num_workers": self.config.num_workers, "prefetch_factor": self.config.prefetch_factor,
+                   "persistent_workers": self.config.persistent_workers}
         if self.device_.type == "cuda":
             runtime["gpu"] = torch.cuda.get_device_name(self.device_)
         logger.info("%s runtime: %s; artifacts=%s", self.series_name_, json.dumps(runtime), self.run_dir_)
@@ -199,6 +279,13 @@ class DynamicNeighborhoodStat:
         self._log_runtime()
         if self.config.reuse_checkpoint and self.checkpoint_path_.is_file():
             self._load(self.checkpoint_path_, expected_fingerprint=self.train_fingerprint_)
+            if self.config.anomaly_ratio is not None and self.validation_scores_ is None:
+                validation = (values[split:] - self.mean_) / self.scale_
+                with self._feature_cache(validation, "validation thresholds"):
+                    self._collect_validation_scores(validation)
+                # Upgrade only the score distribution; preserve weights, support,
+                # coordinate calibration and the original reference threshold.
+                self.save(self.checkpoint_path_)
             # Refresh derived metadata even for checkpoints saved before these fields existed.
             self._write_calibration(split, len(values) - split)
             logger.info("Reusing calibrated checkpoint: %s", self.checkpoint_path_)
@@ -222,8 +309,11 @@ class DynamicNeighborhoodStat:
         with self._progress("training references", values.shape[1] * (len(self.config.spans) + 1)) as progress:
             self.references_ = training_references(train, self.config, progress=progress.update)
         self.model = DualPathNetwork(values.shape[1], self.config, self.references_).to(self.device_)
-        self.training_history_ = self._train(train, validation)
-        self._calibrate(validation)
+        with ExitStack() as caches:
+            caches.enter_context(self._feature_cache(train, "train"))
+            caches.enter_context(self._feature_cache(validation, "validation"))
+            self.training_history_ = self._train(train, validation)
+            self._calibrate(validation)
         self.model.eval()
         self.save(self.checkpoint_path_)
         pd.DataFrame(self.training_history_).to_csv(self.run_dir_ / "training_history.csv", index=False)
@@ -240,12 +330,13 @@ class DynamicNeighborhoodStat:
         names = ("loss", "reconstruction", "loss_n", "loss_s", "regularizer",
                  "concentration_mean", "concentration_exceed_fraction", "concentration_excess")
         totals, count = torch.zeros(len(names), dtype=torch.float64, device=self.device_), 0
-        with torch.set_grad_enabled(training), self._progress(stage or ("train" if training else "validation"), len(loader)) as progress:
-            for batch_index, windows in enumerate(loader, 1):
-                windows = windows.to(self.device_, non_blocking=True)
+        with torch.set_grad_enabled(training), self.model.cached_route_projections(), self._progress(
+                stage or ("train" if training else "validation"), len(loader)) as progress, self._batches(loader) as batches:
+            for batch_index, batch in batches:
+                windows, features = self._prepare_batch(batch)
                 if training:
                     optimizer.zero_grad(set_to_none=True)
-                output = self.model(windows)
+                output = self._forward_batch(windows, features)
                 losses = self.model.losses(windows, output)
                 if not torch.isfinite(losses["loss"]):
                     raise FloatingPointError("Nonfinite loss; inspect input scaling and configured numerical floors")
@@ -312,6 +403,39 @@ class DynamicNeighborhoodStat:
         score = maximum + np.log(np.exp(self.config.beta * (variable - maximum[..., None])).mean(axis=-1)) / self.config.beta
         return score, variable
 
+    def _prepare_scoring(self):
+        """Derived device constants, never part of the checkpoint parameter tree."""
+        self._score_buffers = {"q_n": torch.as_tensor(self.q_n_, device=self.device_),
+                               "q_s": torch.as_tensor(self.q_s_, device=self.device_),
+                               "q_p": torch.as_tensor(self.q_p_, device=self.device_),
+                               "weight": torch.as_tensor(self.config.alpha * self.support_, device=self.device_)}
+        skip = (self.config.device_scoring and self.config.skip_unsupported_targets
+                and not self.config.inference_diagnostics)
+        indices = np.flatnonzero(self.support_) if skip else np.arange(len(self.columns_))
+        self._score_targets = torch.as_tensor(indices, dtype=torch.long, device=self.device_)
+
+    def _score_tensors(self, errors):
+        n, s, p = errors
+        buffers = self._score_buffers
+        own = self.config.chi * p / buffers["q_p"]
+        own = own + (1 - self.config.chi) * (s / buffers["q_s"]).mean(dim=(-2, -1))
+        variable = (1 - buffers["weight"]) * own
+        if n.shape[1]:
+            neighbors = (n / buffers["q_n"].index_select(0, self._score_targets)).mean(dim=(-2, -1))
+            contribution = buffers["weight"].index_select(0, self._score_targets) * neighbors
+            # Target IDs are unique; a copy avoids atomic scatter reductions.
+            variable.index_copy_(1, self._score_targets, variable.index_select(1, self._score_targets) + contribution)
+        score = (torch.logsumexp(self.config.beta * variable, dim=-1) - math.log(len(self.columns_))) / self.config.beta
+        return score, variable
+
+    def _prediction_output(self, windows, features=None):
+        output = self.model.predict(windows, features=features, target_ids=self._score_targets,
+                                    diagnostics=self.config.inference_diagnostics)
+        errors = self.model.errors(windows, output)
+        if self.config.device_scoring:
+            return self._score_tensors(errors), output
+        return self._score_errors(self._pack_errors(errors)), output
+
     @torch.backends.cudnn.flags(enabled=True, benchmark=False, deterministic=True)
     def _calibrate(self, validation):
         """Fixed network -> support -> error quantiles -> full-score quantile."""
@@ -336,10 +460,11 @@ class DynamicNeighborhoodStat:
             errors = np.memmap(errors_path, dtype=np.float64, mode="w+", shape=(count, channels, coordinates))
             concentrations = np.memmap(c_path, dtype=np.float64, mode="w+", shape=(count, channels))
             loader = self._loader(validation)
-            with torch.no_grad(), self._progress("calibration residuals", len(loader)) as progress:
-                for batch_index, windows in enumerate(loader, 1):
-                    windows = windows.to(self.device_, non_blocking=True)
-                    output = self.model(windows)
+            with torch.no_grad(), self.model.cached_route_projections(), self._progress(
+                    "calibration residuals", len(loader)) as progress, self._batches(loader) as batches:
+                for batch_index, batch in batches:
+                    windows, features = self._prepare_batch(batch)
+                    output = self._forward_batch(windows, features)
                     residual_errors = self.model.errors(windows, output)
                     packed = self._pack_errors(residual_errors)
                     stop = offset + len(windows)
@@ -374,6 +499,7 @@ class DynamicNeighborhoodStat:
                     if stop < count:
                         progress.update(stop)
                 self.threshold_ = float(np.quantile(validation_scores, self.config.zeta_threshold))
+                self.validation_scores_ = validation_scores
                 progress.update(count, "threshold={:.6g} support={}/{}".format(self.threshold_, int(self.support_.sum()), channels))
             self.calibration_diagnostics_ = {
                 "concentration_quantiles": np.quantile(concentrations, [0.5, 0.9, 0.95, 0.99]).tolist(),
@@ -389,6 +515,41 @@ class DynamicNeighborhoodStat:
                 if mapping is not None:
                     mapping._mmap.close()
                 path.unlink(missing_ok=True)
+
+    @torch.backends.cudnn.flags(enabled=True, benchmark=False, deterministic=True)
+    @torch.inference_mode()
+    def _collect_validation_scores(self, validation):
+        """Fill legacy checkpoints' missing distribution without refitting calibration."""
+        count = len(validation) - self.config.win_size + 1
+        scores, offset = np.empty(count, dtype=np.float64), 0
+        self.model.eval()
+        loader = self._loader(validation)
+        with self.model.cached_route_projections(), self._progress(
+                "validation label thresholds", len(loader)) as progress, self._batches(loader) as batches:
+            for batch_index, batch in batches:
+                windows, features = self._prepare_batch(batch)
+                output = self._forward_batch(windows, features)
+                score, _ = self._score_errors(self._pack_errors(self.model.errors(windows, output)))
+                scores[offset:offset + len(windows)] = score
+                offset += len(windows)
+                progress.update(batch_index, "windows={}".format(offset))
+        if not np.isfinite(scores).all():
+            raise FloatingPointError("Nonfinite normal validation scores")
+        self.validation_scores_ = scores
+
+    def _label_thresholds(self):
+        if self.model is None or not hasattr(self, "threshold_"):
+            raise RuntimeError("Call detect_fit or load a calibrated checkpoint first")
+        if self.config.anomaly_ratio is None:
+            return {"validation_q{}".format(self.config.zeta_threshold): self.threshold_}
+        scores = getattr(self, "validation_scores_", None)
+        if scores is None:
+            raise RuntimeError("This legacy checkpoint has no validation score distribution. "
+                               "Call detect_fit with the original normal training data once to upgrade it, "
+                               "or load with anomaly_ratio=None for the original reference threshold.")
+        ratios = self.config.anomaly_ratio
+        thresholds = np.percentile(scores, 100 - np.asarray(ratios))
+        return {ratio: float(threshold) for ratio, threshold in zip(ratios, thresholds)}
 
     def freeze_energy_diagnostics(self):
         """Theoretical raw A-error bounds, not alarm or overall-score guarantees."""
@@ -420,6 +581,8 @@ class DynamicNeighborhoodStat:
             "support_model_error": self.support_model_error_.tolist(), "support_mean_error": self.support_mean_error_.tolist(),
             "support_fraction": float(self.support_.mean()), "q_n": self.q_n_.tolist(),
             "q_s": self.q_s_.tolist(), "q_p": self.q_p_.tolist(), "threshold": self.threshold_,
+            "label_thresholds": self._label_thresholds() if (self.config.anomaly_ratio is None
+                                                           or getattr(self, "validation_scores_", None) is not None) else None,
             "top_r": self.model.top_r, "rho_a": self.model.rho_a, "diagnostics": self.calibration_diagnostics_,
         })
 
@@ -434,6 +597,8 @@ class DynamicNeighborhoodStat:
                    "model": {name: value.detach().cpu() for name, value in self.model.state_dict().items()},
                    "threshold": self.threshold_, "best_epoch": self.best_epoch_,
                    "history": self.training_history_, "diagnostics": self.calibration_diagnostics_,
+                   "validation_scores": (torch.as_tensor(self.validation_scores_).cpu()
+                                         if getattr(self, "validation_scores_", None) is not None else None),
                    "split_metadata": getattr(self, "split_metadata_", None)}
         for name in ("mean_", "scale_", "constant_input_", "support_", "support_gain_", "support_model_error_", "support_mean_error_", "q_n_", "q_s_", "q_p_"):
             payload[name] = torch.as_tensor(getattr(self, name)).cpu()
@@ -456,6 +621,8 @@ class DynamicNeighborhoodStat:
         self.model.load_state_dict(payload["model"])
         self.model.eval()
         self.threshold_, self.best_epoch_ = payload["threshold"], payload["best_epoch"]
+        stored_scores = payload.get("validation_scores")
+        self.validation_scores_ = stored_scores.numpy().copy() if stored_scores is not None else None
         self.training_history_, self.calibration_diagnostics_ = payload["history"], payload["diagnostics"]
         self.split_metadata_ = payload.get("split_metadata") or getattr(self, "split_metadata_", None)
         for name in ("mean_", "scale_", "constant_input_", "support_", "support_gain_", "support_model_error_", "support_mean_error_", "q_n_", "q_s_", "q_p_"):
@@ -463,10 +630,11 @@ class DynamicNeighborhoodStat:
         self._prediction_cache = None
 
     @classmethod
-    def load(cls, path, device="auto"):
+    def load(cls, path, device="auto", **runtime_options):
         path = Path(path).resolve()
         payload = torch.load(path, map_location="cpu", weights_only=True)
         config = dict(payload["config"], device=device)
+        config.update(runtime_options)
         detector = cls(**config)
         detector.device_, detector.run_dir_, detector.checkpoint_path_ = detector._device(), path.parent, path
         detector.evaluation_artifact_dir_ = str(path.parent)
@@ -475,6 +643,7 @@ class DynamicNeighborhoodStat:
         return detector
 
     @torch.backends.cudnn.flags(enabled=True, benchmark=False, deterministic=True)
+    @torch.inference_mode()
     def _predict(self, test_data):
         if self.model is None or not hasattr(self, "threshold_"):
             raise RuntimeError("Call detect_fit or load a calibrated checkpoint first")
@@ -499,23 +668,35 @@ class DynamicNeighborhoodStat:
         concentration_totals = torch.zeros(3, dtype=torch.float64, device=self.device_)
         c_count = 0
         self.model.eval()
+        self._prepare_scoring()
         try:
-            loader = self._loader(normalized)
-            with torch.no_grad(), self._progress("test inference", len(loader)) as progress:
-                for batch_index, windows in enumerate(loader, 1):
-                    windows = windows.to(self.device_, non_blocking=True)
-                    output = self.model(windows)
-                    batch_scores, variable_scores = self._score_errors(self._pack_errors(self.model.errors(windows, output)))
-                    stop = offset + len(windows)
-                    scores[offset:stop] = batch_scores
-                    if variable is not None:
-                        variable[offset:stop] = variable_scores
-                    c = output["concentration"]
-                    concentration_totals.add_(torch.stack((c.sum().to(torch.float64),
-                        (c > self.model.rho_a).sum().to(torch.float64), torch.relu(c - self.model.rho_a).sum().to(torch.float64))))
-                    c_count += c.numel()
-                    offset = stop
-                    progress.update(batch_index, "scored={}/{}".format(offset - self.config.win_size + 1, len(loader.dataset)))
+            with self._feature_cache(normalized, "test", neighborhood=bool(len(self._score_targets))):
+                loader = self._loader(normalized)
+                with self.model.cached_route_projections(enabled=bool(len(self._score_targets))), self._progress(
+                        "test inference", len(loader)) as progress, self._batches(loader) as batches:
+                    for batch_index, batch in batches:
+                        windows, features = self._prepare_batch(batch)
+                        (batch_scores, variable_scores), output = self._prediction_output(windows, features)
+                        stop = offset + len(windows)
+                        if isinstance(batch_scores, torch.Tensor):
+                            # Transfer only final outputs; residual coordinates stay on device.
+                            if variable is not None:
+                                packed = torch.cat((batch_scores[:, None], variable_scores), dim=1).cpu().numpy()
+                                scores[offset:stop], variable[offset:stop] = packed[:, 0], packed[:, 1:]
+                            else:
+                                scores[offset:stop] = batch_scores.cpu().numpy()
+                        else:
+                            scores[offset:stop] = batch_scores
+                            if variable is not None:
+                                variable[offset:stop] = variable_scores
+                        if self.config.inference_diagnostics:
+                            c = output["concentration"]
+                            concentration_totals.add_(torch.stack((c.sum().to(torch.float64),
+                                (c > self.model.rho_a).sum().to(torch.float64),
+                                torch.relu(c - self.model.rho_a).sum().to(torch.float64))))
+                            c_count += c.numel()
+                        offset = stop
+                        progress.update(batch_index, "scored={}/{}".format(offset - self.config.win_size + 1, len(loader.dataset)))
         finally:
             if variable is not None:
                 variable.flush()
@@ -528,23 +709,60 @@ class DynamicNeighborhoodStat:
         pd.DataFrame({"position": np.arange(len(values)), "input_index": test_data.index,
                       "valid": self.evaluation_valid_mask_, "score": scores, "alarm": alarms}).to_csv(
                           self.run_dir_ / "test_predictions.csv", index=False)
-        _json(self.run_dir_ / "test_diagnostics.json", {
+        diagnostics = {
             "test_fingerprint": key, "test_length": len(values),
             "valid_start": self.config.win_size - 1, "valid_points": int(self.evaluation_valid_mask_.sum()),
             "threshold": self.threshold_, "support_fraction": float(self.support_.mean()),
-            "concentration_mean": c_sum / c_count, "concentration_exceed_fraction": c_exceed / c_count,
-            "concentration_mean_excess": c_excess / c_count,
-        })
+            "concentration_diagnostics": self.config.inference_diagnostics,
+            "neighborhood_target_rows": len(self._score_targets),
+        }
+        if c_count:
+            diagnostics.update(concentration_mean=c_sum / c_count, concentration_exceed_fraction=c_exceed / c_count,
+                               concentration_mean_excess=c_excess / c_count)
+        _json(self.run_dir_ / "test_diagnostics.json", diagnostics)
         self._prediction_cache = (key, scores.copy())
         logger.info("%s: test predictions saved to %s", self.series_name_, self.run_dir_ / "test_predictions.csv")
         return scores
+
+    @torch.backends.cudnn.flags(enabled=True, benchmark=False, deterministic=True)
+    @torch.inference_mode()
+    def score_window(self, window, return_variable_scores=False):
+        """Score exactly one current L-window, without files or historical state."""
+        if self.model is None or not hasattr(self, "threshold_"):
+            raise RuntimeError("Call detect_fit or load a calibrated checkpoint first")
+        values = self._values(window)
+        if len(values) != self.config.win_size or list(window.columns) != self.columns_:
+            raise ValueError("A current window must have win_size rows and the fitted feature columns/order")
+        self.model.eval()
+        self._prepare_scoring()
+        windows = torch.from_numpy(np.ascontiguousarray((values - self.mean_) / self.scale_))[None].to(self.device_)
+        with self.model.cached_route_projections(enabled=bool(len(self._score_targets))):
+            (scores, variables), _ = self._prediction_output(windows)
+        score = float(scores[0])
+        if not math.isfinite(score):
+            raise FloatingPointError("Nonfinite window score")
+        result = {"score": score, "alarm": score > self.threshold_}
+        if return_variable_scores:
+            result["variable_scores"] = variables[0].cpu().numpy() if isinstance(variables, torch.Tensor) else variables[0].copy()
+        return result
 
     def detect_score(self, test_data):
         scores = self._predict(test_data)
         return scores, scores.copy()
 
     def detect_label(self, test_data):
+        self.label_thresholds_ = self._label_thresholds()
         scores = self._predict(test_data)
-        alarms = np.zeros(len(scores), dtype=np.int8)
-        alarms[self.evaluation_valid_mask_] = (scores[self.evaluation_valid_mask_] > self.threshold_).astype(np.int8)
-        return {"validation_q{}".format(self.config.zeta_threshold): alarms}, scores
+        predictions = {}
+        records = {"position": np.arange(len(scores)), "input_index": test_data.index,
+                   "valid": self.evaluation_valid_mask_, "score": scores}
+        for ratio, threshold in self.label_thresholds_.items():
+            alarms = np.zeros(len(scores), dtype=np.int8)
+            alarms[self.evaluation_valid_mask_] = (scores[self.evaluation_valid_mask_] > threshold).astype(np.int8)
+            predictions[ratio] = alarms
+            records["alarm_ratio_{}".format(ratio)] = alarms
+        pd.DataFrame(records).to_csv(self.run_dir_ / "test_labels.csv", index=False)
+        _json(self.run_dir_ / "label_thresholds.json", {
+            "source": "normal_validation", "reference_threshold": self.threshold_,
+            "thresholds": self.label_thresholds_, "ratios_are_percentages": self.config.anomaly_ratio is not None})
+        return predictions, scores

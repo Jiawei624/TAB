@@ -1,5 +1,7 @@
 """Independent neighborhood and strictly causal univariate predictors."""
 
+from contextlib import contextmanager
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -70,6 +72,8 @@ class DualPathNetwork(nn.Module):
         self.rho_a = (1 + self.top_r / n) / 2 if n >= 2 else 1.0
         off_diagonal = 1 - torch.eye(channels)
         self.register_buffer("context_mask", off_diagonal / n)
+        self.register_buffer("source_ids", torch.arange(channels), persistent=False)
+        self._route_cache = None
 
         # Neighborhood modules share parameters across variables/scales, not with the self path.
         self.variable_n = nn.Embedding(channels, emb)
@@ -91,30 +95,52 @@ class DualPathNetwork(nn.Module):
             self.encoder_n.add_readouts(length, (length - 1,))
         self.self_readouts = tuple(config.win_size - h - 1 for h in config.spans) + (config.win_size - 2,)
         self.encoder_s.add_readouts(config.win_size - 1, self.self_readouts)
+        if config.pack_scales:
+            for indices in ((1, 2), (3, 4, 5)):
+                lengths = tuple(config.win_size // config.scales[i] for i in indices)
+                self.encoder_n.add_readouts(max(lengths), tuple(length - 1 for length in lengths))
 
-    @staticmethod
-    def _project_parts(layer, *inputs):
-        weights = layer.weight.split([value.shape[-1] for value in inputs], dim=1)
-        return tuple(F.linear(value, weight) for value, weight in zip(inputs, weights))
+    @contextmanager
+    def cached_route_projections(self, enabled=True):
+        """Cache identity-only projections for one frozen evaluation pass."""
+        enabled = (enabled and not self.training and not torch.is_grad_enabled()
+                   and self.config.factorized_routing and self.config.cache_static_projections)
+        self._route_cache = self._identity_projections() if enabled else None
+        try:
+            yield
+        finally:
+            self._route_cache = None
+
+    def _identity_projections(self):
+        variable, scale = self.variable_n.weight, self.scale_n.weight
+        emb, message = self.config.embedding_dim, self.config.message_dim
+        gi, gj, gm, _, _ = self.scale_gate[0].weight.split(
+            (emb, emb, emb, self.config.hidden_n, self.config.context_dim), dim=1)
+        _, vi, vj, vm = self.value[0].weight.split((self.config.hidden_n, emb, emb, emb), dim=1)
+        ri, rj, _, _ = self.relation[0].weight.split((emb, emb, message, self.config.context_dim), dim=1)
+        _, di, dm = self.decoder_n[0].weight.split((message, emb, emb), dim=1)
+        return (F.linear(variable, gi), F.linear(variable, gj), F.linear(scale, gm),
+                F.linear(variable, vi), F.linear(variable, vj), F.linear(scale, vm),
+                F.linear(variable, ri), F.linear(variable, rj), F.linear(variable, di), F.linear(scale, dm))
 
     def _route_projections(self, encoded, context):
         """Project each source/target once; nonlinear mixing still sees every pair."""
-        variable, scale = self.variable_n.weight, self.scale_n.weight
-        gi, gj, gm, gh, gc = self._project_parts(self.scale_gate[0], variable, variable, scale, encoded, context)
+        gi, gj, gm, vi, vj, vm, ri, rj, di, dm = (
+            self._route_cache if self._route_cache is not None else self._identity_projections())
+        emb, message = self.config.embedding_dim, self.config.message_dim
+        _, _, _, wh, wc = self.scale_gate[0].weight.split(
+            (emb, emb, emb, self.config.hidden_n, self.config.context_dim), dim=1)
+        gh, gc = F.linear(encoded, wh), F.linear(context, wc)
         scale_source = gh + gj[None, :, None] + gm[None, None] + self.scale_gate[0].bias
         scale_target = gc + gi[None]
-        vh, vi, vj, vm = self._project_parts(self.value[0], encoded, variable, variable, scale)
+        vh = F.linear(encoded, self.value[0].weight[:, :self.config.hidden_n])
         value_source = vh + vj[None, :, None] + vm[None, None] + self.value[0].bias
-        emb, message = self.config.embedding_dim, self.config.message_dim
-        wi, wj, _, wc = self.relation[0].weight.split((emb, emb, message, self.config.context_dim), dim=1)
-        relation_target = F.linear(context, wc) + F.linear(variable, wi)[None] + self.relation[0].bias
-        relation_source = F.linear(variable, wj)
-        _, wi, wm = self.decoder_n[0].weight.split((message, emb, emb), dim=1)
-        return (scale_source, scale_target, value_source, vi, relation_target, relation_source,
-                F.linear(variable, wi), F.linear(scale, wm))
+        wc = self.relation[0].weight[:, 2 * emb + message:]
+        relation_target = F.linear(context, wc) + ri[None] + self.relation[0].bias
+        return (scale_source, scale_target, value_source, vi, relation_target, rj, di, dm)
 
     def _route_projected(self, scale_source, scale_target, value_source, value_target,
-                         relation_target, relation_source, decoder_target, decoder_scale, target_ids):
+                         relation_target, relation_source, decoder_target, decoder_scale, target_ids, diagnostics=True):
         scale_hidden = scale_source[:, None] + scale_target[:, target_ids, None, None]
         weights_scale = torch.softmax(self.scale_gate[2](self.scale_gate[1](scale_hidden)).squeeze(-1)
                                       / self.config.temperature_scale, dim=-1)
@@ -124,19 +150,21 @@ class DualPathNetwork(nn.Module):
         wm = self.relation[0].weight[:, 2 * emb:2 * emb + message]
         relation_hidden = F.linear(messages, wm) + relation_target[:, target_ids, None] + relation_source[None, None]
         logits = self.relation[2](self.relation[1](relation_hidden)).squeeze(-1) / self.config.temperature_relation
-        self_mask = target_ids[:, None] == torch.arange(self.channels, device=messages.device)[None]
+        self_mask = target_ids[:, None] == self.source_ids[None]
         attention = torch.softmax(logits.masked_fill(self_mask[None], -torch.inf), dim=-1)
         aggregate = (attention[..., None] * messages).sum(dim=-2)
         decoded = F.linear(aggregate, self.decoder_n[0].weight[:, :message], self.decoder_n[0].bias)[:, :, None]
         decoded = decoded + decoder_target[target_ids][None, :, None] + decoder_scale[None, None]
         prediction = self.decoder_n[2](self.decoder_n[1](decoded))
-        concentration = attention.topk(self.top_r, dim=-1).values.sum(dim=-1) if self.top_r else attention.sum(dim=-1)
+        if not diagnostics:
+            return prediction, None, None
+        concentration = attention.topk(self.top_r, dim=-1, sorted=False).values.sum(dim=-1) if self.top_r else attention.sum(dim=-1)
         magnitude = messages.abs().amax(dim=-1).masked_fill(self_mask[None], 0)
         diagnostics = torch.stack((magnitude.sum(dim=-1) / (self.channels - 1),
                                    (magnitude * attention).sum(dim=-1) / (self.channels - 1)), dim=-1)
         return prediction, concentration, diagnostics
 
-    def _route(self, encoded, context, target_ids):
+    def _route(self, encoded, context, target_ids, diagnostics=True):
         """A target chunk still normalizes over ALL nonself sources and ALL scales."""
         batch, channels, scales, _ = encoded.shape
         count = len(target_ids)
@@ -156,7 +184,7 @@ class DualPathNetwork(nn.Module):
         messages = (weights_scale[..., None] * messages_scale).sum(dim=-2)
         rel_input = torch.cat((ei[..., 0, :], ej[..., 0, :], messages, ci[..., 0, :]), dim=-1)
         logits = self.relation(rel_input).squeeze(-1) / self.config.temperature_relation
-        self_mask = target_ids[:, None] == torch.arange(channels, device=encoded.device)[None, :]
+        self_mask = target_ids[:, None] == self.source_ids[None, :]
         attention = torch.softmax(logits.masked_fill(self_mask[None], -torch.inf), dim=-1)
         aggregate = (attention[..., None] * messages).sum(dim=-2)
         decoder_input = torch.cat((
@@ -164,8 +192,10 @@ class DualPathNetwork(nn.Module):
             target[None, :, None].expand(batch, count, scales, -1),
             scale[None, None].expand(batch, count, scales, -1)), dim=-1)
         prediction = self.decoder_n(decoder_input)
+        if not diagnostics:
+            return prediction, None, None
         if self.top_r:
-            concentration = attention.topk(self.top_r, dim=-1).values.sum(dim=-1)
+            concentration = attention.topk(self.top_r, dim=-1, sorted=False).values.sum(dim=-1)
         else:
             concentration = attention.sum(dim=-1)  # d=2: exactly one source, no penalty
         magnitude = messages.abs().amax(dim=-1).masked_fill(self_mask[None], 0)
@@ -175,40 +205,80 @@ class DualPathNetwork(nn.Module):
                                    weighted_magnitude.sum(dim=-1) / (channels - 1)), dim=-1)
         return prediction, concentration, diagnostics
 
-    def forward(self, windows):
-        batch, _, channels = windows.shape
-        coarse = self.observations.coarse(windows)
-        embeddings = self.variable_n.weight
-        encoded = []
+    def _neighbor_context(self, variable_context):
+        if not self.config.efficient_context:
+            return torch.einsum("ij,bjc->bic", self.context_mask, variable_context)
+        # Exclusive prefix/suffix sums are O(d), like sum-minus-self, without
+        # ever including the excluded target in a rounded intermediate sum.
+        zero = torch.zeros_like(variable_context[:, :1])
+        left = torch.cat((zero, variable_context[:, :-1].cumsum(dim=1)), dim=1)
+        right = variable_context[:, 1:].flip(1).cumsum(dim=1).flip(1)
+        return (left + torch.cat((right, zero), dim=1)) / (self.channels - 1)
+
+    def _encode_neighbors(self, coarse):
+        batch, channels = coarse[0].shape[:2]
+        sequences = []
         for index, z in enumerate(coarse):
             blocks = z.shape[2]
-            sequence = torch.cat((z.float(),
-                                  embeddings[None, :, None].expand(batch, channels, blocks, -1),
-                                  self.scale_n.weight[index][None, None, None].expand(
-                                      batch, channels, blocks, -1)), dim=-1)
-            h = self.encoder_n(sequence.reshape(batch * channels, blocks, -1),
-                               readouts=(blocks - 1,) if self.config.prune_tcn else None)[:, -1]
-            encoded.append(h.reshape(batch, channels, -1))
-        encoded = torch.stack(encoded, dim=2)
-        variable_context = self.context(encoded.flatten(start_dim=2))
-        # A masked sum (rather than total-minus-self) also avoids cancellation by the excluded input.
-        context = torch.einsum("ij,bjc->bic", self.context_mask, variable_context)
-        predictions, concentrations, diagnostics = [], [], []
-        projected = self._route_projections(encoded, context) if self.config.factorized_routing else None
-        for start in range(0, channels, self.config.target_chunk_size):
-            ids = torch.arange(start, min(start + self.config.target_chunk_size, channels), device=windows.device)
+            sequences.append(torch.cat((z.float(),
+                self.variable_n.weight[None, :, None].expand(batch, channels, blocks, -1),
+                self.scale_n.weight[index][None, None, None].expand(batch, channels, blocks, -1)), dim=-1
+            ).reshape(batch * channels, blocks, -1))
+        groups = ((0,), (1, 2), (3, 4, 5)) if self.config.pack_scales else tuple((i,) for i in range(len(coarse)))
+        encoded = [None] * len(coarse)
+        for group in groups:
+            lengths = tuple(sequences[index].shape[1] for index in group)
+            positions = tuple(length - 1 for length in lengths)
+            length = max(lengths)
+            packed = torch.cat([F.pad(sequences[index], (0, 0, 0, length - n))
+                                for index, n in zip(group, lengths)], dim=0) if len(group) > 1 else sequences[group[0]]
+            hidden = self.encoder_n(packed, readouts=positions if self.config.prune_tcn else None)
+            for offset, (index, position) in enumerate(zip(group, positions)):
+                state = hidden[offset * batch * channels:(offset + 1) * batch * channels,
+                               offset if self.config.prune_tcn else position]
+                encoded[index] = state.reshape(batch, channels, -1)
+        return torch.stack(encoded, dim=2)
+
+    def forward(self, windows):
+        return self._forward(windows)
+
+    def forward_cached(self, windows, features):
+        return self._forward(windows, features=features)
+
+    def predict(self, windows, features=None, target_ids=None, diagnostics=False):
+        if self.training:
+            raise RuntimeError("The lightweight prediction path requires eval mode")
+        return self._forward(windows, features=features, target_ids=target_ids, diagnostics=diagnostics)
+
+    def _forward(self, windows, features=None, target_ids=None, diagnostics=True):
+        if features is not None and windows.requires_grad:
+            raise ValueError("Input sensitivity requires recomputing observations from the raw windows")
+        batch, _, channels = windows.shape
+        collect_diagnostics = diagnostics
+        predictions, concentrations, diagnostic_rows = [], [], []
+        # Full training/calibration always uses every target. Only deployment
+        # may supply a subset; every variable remains a source for those rows.
+        targets = self.source_ids if target_ids is None else target_ids
+        if len(targets):
+            coarse = self.observations.coarse(windows) if features is None else features["coarse"]
+            encoded = self._encode_neighbors(coarse)
+            context = self._neighbor_context(self.context(encoded.flatten(start_dim=2)))
+            projected = self._route_projections(encoded, context) if self.config.factorized_routing else None
+        for start in range(0, len(targets), self.config.target_chunk_size):
+            ids = targets[start:start + self.config.target_chunk_size]
             if projected is not None:
-                if self.training and self.config.gradient_checkpointing:
+                if self.training and self.config.gradient_checkpointing and collect_diagnostics:
                     chunk = checkpoint(self._route_projected, *projected, ids, use_reentrant=False)
                 else:
-                    chunk = self._route_projected(*projected, ids)
-            elif self.training and self.config.gradient_checkpointing:
+                    chunk = self._route_projected(*projected, ids, diagnostics=collect_diagnostics)
+            elif self.training and self.config.gradient_checkpointing and collect_diagnostics:
                 chunk = checkpoint(self._route, encoded, context, ids, use_reentrant=False)
             else:
-                chunk = self._route(encoded, context, ids)
+                chunk = self._route(encoded, context, ids, diagnostics=collect_diagnostics)
             predictions.append(chunk[0])
-            concentrations.append(chunk[1])
-            diagnostics.append(chunk[2])
+            if collect_diagnostics:
+                concentrations.append(chunk[1])
+                diagnostic_rows.append(chunk[2])
 
         # No current target, trend estimate, or target statistic enters the self encoder.
         history = windows[:, :-1].transpose(1, 2).float()
@@ -229,16 +299,23 @@ class DualPathNetwork(nn.Module):
                             torch.tanh(raw[..., 1]), torch.sigmoid(raw[..., 2])), dim=-1)
         stat = torch.where(self.fixed_s[None], self.fixed_values_s[None], stat)
         point = self.point_head(torch.cat((own_hidden[:, :, -1], own_id[None].expand(batch, -1, -1)), dim=-1)).squeeze(-1)
-        concentration = torch.cat(concentrations, dim=1)
-        regularizer = F.relu(concentration - self.rho_a).square().mean() if self.top_r else concentration.sum() * 0
-        return {"prediction_n": torch.cat(predictions, dim=1), "prediction_s": stat,
-                "prediction_p": point, "target_n": torch.stack([z[:, :, -1] for z in coarse], dim=2),
-                "concentration": concentration, "regularizer": regularizer,
-                "message_diagnostics": torch.cat(diagnostics, dim=1)}
+        result = {"prediction_n": torch.cat(predictions, dim=1) if predictions else windows.new_empty(batch, 0, len(self.config.scales), 2),
+                  "prediction_s": stat, "prediction_p": point,
+                  "target_n": torch.stack([z[:, :, -1] for z in coarse], dim=2).index_select(1, targets)
+                  if len(targets) else windows.new_empty(batch, 0, len(self.config.scales), 2)}
+        if collect_diagnostics:
+            concentration = torch.cat(concentrations, dim=1)
+            result.update(concentration=concentration,
+                          regularizer=F.relu(concentration - self.rho_a).square().mean() if self.top_r else concentration.sum() * 0,
+                          message_diagnostics=torch.cat(diagnostic_rows, dim=1))
+        if features is not None:
+            result["target_s"] = features["statistics"]
+        return result
 
     def errors(self, windows, output):
         n = (output["target_n"] - output["prediction_n"]).square()
-        s = (self.observations.statistics(windows, self.energy_floor) - output["prediction_s"]).square()
+        statistics = output["target_s"] if "target_s" in output else self.observations.statistics(windows, self.energy_floor)
+        s = (statistics - output["prediction_s"]).square()
         p = (windows[:, -1].to(torch.float64) - output["prediction_p"]).square()
         return n, s, p
 

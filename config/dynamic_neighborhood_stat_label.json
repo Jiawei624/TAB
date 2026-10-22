@@ -5,12 +5,19 @@
   },
   "model_config": {"models": [], "recommend_model_hyper_params": {}},
   "evaluation_config": {
-    "metrics": ["precision", "recall", "f_score", "fpr", "add"],
+    "metrics": "all",
+    "record_compression": null,
     "strategy_args": {"strategy_name": "unfixed_detect_label", "seed": 42}
   },
   "report_config": {
     "aggregate_type": "mean",
-    "report_metrics": ["precision", "recall", "f_score", "fpr", "add"],
+    "group_by": ["typical_anomaly_ratio"],
+    "report_metrics": [
+      "accuracy", "f_score", "precision", "recall",
+      "adjust_accuracy", "adjust_f_score", "adjust_precision", "adjust_recall",
+      "rrecall", "rprecision", "precision_at_k", "rf",
+      "affiliation_f", "affiliation_precision", "affiliation_recall", "add", "fpr"
+    ],
     "fill_type": "mean_value",
     "null_value_threshold": 0.0
   }

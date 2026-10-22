@@ -11,7 +11,14 @@ class Observations(nn.Module):
         self.win_size, self.scales, self.spans = win_size, tuple(scales), tuple(spans)
         self.register_buffer("time_index", torch.arange(win_size, dtype=torch.float64))
         for length in sorted(set(scales) | set(spans)):
-            self.register_buffer("u_{}".format(length), torch.linspace(-1, 1, length, dtype=torch.float64))
+            u = torch.linspace(-1, 1, length, dtype=torch.float64)
+            self.register_buffer("u_{}".format(length), u)
+            self.register_buffer("u_abs_{}".format(length), u.abs().sum(), persistent=False)
+            self.register_buffer("u_squared_{}".format(length), u.square().sum(), persistent=False)
+        for m in scales:
+            ends = torch.arange(m, win_size + 1, m)
+            self.register_buffer("ends_{}".format(m), ends, persistent=False)
+            self.register_buffer("starts_{}".format(m), ends - m, persistent=False)
 
     def coarse(self, windows):
         """[B,L,d] -> list of [B,d,L/m,2], ordered oldest to newest."""
@@ -20,13 +27,12 @@ class Observations(nn.Module):
         weighted = torch.cat((torch.zeros_like(x[..., :1]), (x * self.time_index).cumsum(dim=-1)), dim=-1)
         result = []
         for m in self.scales:
-            u = getattr(self, "u_{}".format(m))
-            ends = torch.arange(m, self.win_size + 1, m, device=x.device)
-            starts = ends - m
+            ends = getattr(self, "ends_{}".format(m))
+            starts = getattr(self, "starts_{}".format(m))
             total = sums[..., ends] - sums[..., starts]
             local_weighted = weighted[..., ends] - weighted[..., starts] - starts * total
             level = total / m
-            change = (2 * local_weighted / (m - 1) - total) / u.abs().sum()
+            change = (2 * local_weighted / (m - 1) - total) / getattr(self, "u_abs_{}".format(m))
             result.append(torch.stack((level, change), dim=-1))
         return result
 
@@ -37,7 +43,7 @@ class Observations(nn.Module):
         for index, h in enumerate(self.spans):
             block = x[..., -h:]
             u = getattr(self, "u_{}".format(h))
-            slope = (block * u).sum(dim=-1, keepdim=True) / u.square().sum()
+            slope = (block * u).sum(dim=-1, keepdim=True) / getattr(self, "u_squared_{}".format(h))
             residual = block - block.mean(dim=-1, keepdim=True) - slope * u
             energy = residual.square().sum(dim=-1)
             floor = energy_floor[:, index]

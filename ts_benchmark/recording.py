@@ -129,7 +129,7 @@ def find_record_files(directory: str) -> List[str]:
 
 
 def save_log(
-    result_df: pd.DataFrame, save_path, file_prefix: str, compress_method: str = "gz"
+    result_df: pd.DataFrame, save_path, file_prefix: str, compress_method: Optional[str] = "gz"
 ) -> str:
     """
     Save log data.
@@ -164,4 +164,6 @@ def save_log(
     record_filename = file_prefix + get_unique_file_suffix()
     file_path = os.path.join(result_path, record_filename)
 
-    return write_record_file(result_df, file_path, compress_method)
+    record_path = write_record_file(result_df, file_path, compress_method)
+    logger.info("Evaluation records saved to %s", record_path)
+    return record_path

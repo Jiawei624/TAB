@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 import functools
+import logging
+import time
 import traceback
 from typing import List, Tuple, Any, Union
 
@@ -7,6 +9,8 @@ import numpy as np
 import pandas as pd
 
 from ts_benchmark.evaluation.metrics import METRICS
+
+logger = logging.getLogger(__name__)
 
 
 def encode_params(params):
@@ -100,15 +104,18 @@ class Evaluator:
         """
         evaluate_result = []
         log_info = ""
-        for m in self.metric_funcs:
+        for metric_name, m in zip(self.metric_names, self.metric_funcs):
+            started = time.perf_counter()
+            logger.info("Computing evaluation metric %s", metric_name)
             try:
                 evaluate_result.append(
                     m(actual, predicted, scaler=scaler, hist_data=hist_data, **kwargs)
                 )
             except Exception as e:
                 evaluate_result.append(np.nan)
-                name = getattr(m, "__name__", repr(m))
-                log_info += f"Error in calculating {name}: {traceback.format_exc()}\n{e}\n"
+                log_info += f"Error in calculating {metric_name}: {traceback.format_exc()}\n{e}\n"
+                logger.warning("Evaluation metric %s failed: %s", metric_name, e)
+            logger.info("Evaluation metric %s finished in %.3fs", metric_name, time.perf_counter() - started)
         return evaluate_result, log_info
 
     def default_result(self):

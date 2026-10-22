@@ -5,12 +5,13 @@
   },
   "model_config": {"models": [], "recommend_model_hyper_params": {}},
   "evaluation_config": {
-    "metrics": ["auc_pr", "auc_roc"],
+    "metrics": "all",
+    "record_compression": null,
     "strategy_args": {"strategy_name": "unfixed_detect_score", "seed": 42}
   },
   "report_config": {
     "aggregate_type": "mean",
-    "report_metrics": ["auc_pr", "auc_roc"],
+    "report_metrics": ["auc_roc", "auc_pr", "R_AUC_ROC", "R_AUC_PR", "VUS_ROC", "VUS_PR"],
     "fill_type": "mean_value",
     "null_value_threshold": 0.0
   }

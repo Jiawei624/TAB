@@ -32,6 +32,7 @@ from ts_benchmark.data.data_pool import DataPool
 from ts_benchmark.data.data_source import LocalDataSource
 from ts_benchmark.evaluation.evaluate_model import eval_model
 from ts_benchmark.evaluation.evaluator import Evaluator
+from ts_benchmark.evaluation.metrics import classification_metrics_label, classification_metrics_score
 from ts_benchmark.evaluation.strategy.anomaly_detect import UnFixedDetectLabel
 from ts_benchmark.evaluation.metrics.classification_metrics_label import add
 from ts_benchmark.models import ModelFactory
@@ -242,8 +243,14 @@ class TabLifecycleChecks(unittest.TestCase):
                 cudnn_states.append(torch.backends.cudnn.enabled)
                 return original_forward(network, windows)
 
-            with patch.object(DualPathNetwork, "forward", record_runtime):
+            with patch.object(DualPathNetwork, "forward", record_runtime), \
+                 patch.object(DynamicNeighborhoodStat, "_predict", autospec=True,
+                              side_effect=DynamicNeighborhoodStat._predict) as predict:
                 labels, fitted = evaluate("label")
+            self.assertEqual(predict.call_count, 1)  # all ten ratios share one test scoring pass
+            ratios = Config().anomaly_ratio
+            self.assertEqual(labels["typical_anomaly_ratio"].tolist(), ratios)
+            self.assertTrue(set(classification_metrics_label.__all__).issubset(labels.columns))
             self.assertTrue(cudnn_states)
             self.assertTrue(all(cudnn_states))
             self.assertFalse(torch.backends.cudnn.enabled)  # restore TAB's inherited setting
@@ -254,6 +261,10 @@ class TabLifecycleChecks(unittest.TestCase):
             self.assertEqual(calibration["split_metadata"]["validation"]["first_score_index"], 351)
             self.assertEqual(calibration["split_metadata"]["validation"]["window_count"], 9)
             self.assertEqual(np.asarray(calibration["freeze_energy"]["margin"]).shape, (3, 2))
+            thresholds = fitted._label_thresholds()
+            np.testing.assert_allclose(list(thresholds.values()),
+                                       np.percentile(fitted.validation_scores_, 100 - np.asarray(ratios)))
+            self.assertAlmostEqual(thresholds[1.0], fitted.threshold_)
             predictions = pd.read_csv(fitted.run_dir_ / "test_predictions.csv")
             progress = json.loads((fitted.run_dir_ / "runtime_progress.json").read_text())
             self.assertIn("test inference", progress["stage"])
@@ -268,34 +279,59 @@ class TabLifecycleChecks(unittest.TestCase):
             self.assertTrue(np.isfinite(predictions["score"].iloc[63:]).all())
             actual = data["label"].to_numpy()[360:]
             alarm = predictions["alarm"].to_numpy()
-            self.assertAlmostEqual(labels.loc[0, "f_score"], f1_score(actual[63:], alarm[63:], zero_division=0))
+            reference = labels.loc[labels["typical_anomaly_ratio"] == 1.0].iloc[0]
+            self.assertAlmostEqual(reference["f_score"], f1_score(actual[63:], alarm[63:], zero_division=0))
             hits = np.flatnonzero(alarm[82:96])
             expected_delay = float(hits[0]) if len(hits) else 14.0
-            self.assertEqual(labels.loc[0, "add"], expected_delay)
+            self.assertEqual(reference["add"], expected_delay)
             events = pd.read_csv(fitted.run_dir_ / "test_events.csv")
-            self.assertEqual(events["eligible_for_add"].tolist(), [False, True, False])
+            self.assertEqual(len(events), 3 * len(ratios))
+            self.assertEqual(events.loc[events["typical_anomaly_ratio"] == 1.0, "eligible_for_add"].tolist(), [False, True, False])
+            evaluation = json.loads((fitted.run_dir_ / "evaluation_label.json").read_text())
+            self.assertEqual([group["typical_anomaly_ratio"] for group in evaluation["groups"]], ratios)
+            label_predictions = pd.read_csv(fitted.run_dir_ / "test_labels.csv")
+            for ratio, threshold in thresholds.items():
+                np.testing.assert_array_equal(label_predictions["alarm_ratio_{}".format(ratio)].to_numpy()[63:],
+                                              predictions["score"].to_numpy()[63:] > threshold)
             self.assertEqual(len(predictions), 170)  # last incomplete batch included
             # Missing diagnostic metadata in an older checkpoint must not force retraining.
             payload = torch.load(fitted.checkpoint_path_, map_location="cpu", weights_only=True)
             self.assertIn("split_metadata", payload)
             payload.pop("split_metadata")
+            payload.pop("validation_scores")
+            payload["config"].pop("anomaly_ratio")
             payload["config"].pop("factorized_routing")
             payload["config"].pop("prune_tcn")
             self.assertFalse(any("readout_plans" in name for name in payload["model"]))
             torch.save(payload, fitted.checkpoint_path_)
+            legacy = DynamicNeighborhoodStat.load(fitted.checkpoint_path_, device="cpu")
+            with self.assertRaisesRegex(RuntimeError, "normal training data"):
+                legacy._label_thresholds()
+            fixed = DynamicNeighborhoodStat.load(fitted.checkpoint_path_, device="cpu", anomaly_ratio=None)
+            self.assertEqual(fixed._label_thresholds(), {"validation_q0.99": fitted.threshold_})
             calibration.pop("split_metadata")
             calibration.pop("freeze_energy")
             (fitted.run_dir_ / "calibration.json").write_text(json.dumps(calibration), encoding="utf-8")
             # The score strategy must load the SAME normal calibration, never refit it.
-            with patch.object(DynamicNeighborhoodStat, "_train", side_effect=AssertionError("unexpected retraining")):
+            with patch.object(DynamicNeighborhoodStat, "_train", side_effect=AssertionError("unexpected retraining")), \
+                 patch.object(DynamicNeighborhoodStat, "_collect_validation_scores", autospec=True,
+                              side_effect=DynamicNeighborhoodStat._collect_validation_scores) as collect_validation:
                 scores, reused = evaluate("score")
+            self.assertEqual(collect_validation.call_count, 1)
+            self.assertTrue(set(classification_metrics_score.__all__).issubset(scores.columns))
             self.assertEqual(reused.checkpoint_path_, fitted.checkpoint_path_)
             self.assertEqual(reused.threshold_, fitted.threshold_)
+            np.testing.assert_allclose(reused.validation_scores_, fitted.validation_scores_, rtol=1e-12, atol=1e-12)
+            for name in ("q_n_", "q_s_", "q_p_", "support_"):
+                np.testing.assert_array_equal(getattr(reused, name), getattr(fitted, name))
+            for name, value in fitted.model.state_dict().items():
+                torch.testing.assert_close(reused.model.state_dict()[name], value, rtol=0, atol=0)
             refreshed = json.loads((reused.run_dir_ / "calibration.json").read_text())
             self.assertEqual(refreshed["split_metadata"]["validation"]["first_score_index"], 351)
             self.assertIn("freeze_energy", refreshed)
             self.assertAlmostEqual(scores.loc[0, "auc_pr"], average_precision_score(actual[63:], predictions["score"].to_numpy()[63:]))
             restored = DynamicNeighborhoodStat.load(fitted.checkpoint_path_, device="cpu")
+            np.testing.assert_allclose(list(restored._label_thresholds().values()), list(thresholds.values()), rtol=1e-12)
             restored_scores, _ = restored.detect_score(data.iloc[360:].drop(columns="label"))
             np.testing.assert_allclose(restored_scores, predictions["score"].to_numpy(), rtol=1e-12, atol=1e-12, equal_nan=True)
             with self.assertRaisesRegex(ValueError, "clean normal"):
@@ -318,14 +354,14 @@ class TabLifecycleChecks(unittest.TestCase):
                  contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 launcher.main(launch_args)
             summary = pd.read_csv(runtime / "launcher" / "summary.csv")
-            self.assertEqual(len(summary), 7)
+            self.assertEqual(len(summary), len(ratios) * len(classification_metrics_label.__all__) + len(classification_metrics_score.__all__))
             self.assertTrue((summary["valid_seeds"] == 1).all())
             self.assertTrue(summary["std"].isna().all())  # one seed cannot define sample std
             self.assertTrue((summary["valid_points_min"] == 107).all())
             self.assertTrue((summary["valid_points_max"] == 107).all())
             self.assertTrue((summary["excluded_boundary_events_max"] == 2).all())
             coverage = pd.read_csv(runtime / "launcher" / "evaluation_coverage.csv")
-            self.assertEqual(len(coverage), 2)
+            self.assertEqual(len(coverage), len(ratios) + 1)
             self.assertTrue((coverage["test_length"] == 170).all())
             self.assertTrue((coverage["excluded_points"] == 63).all())
             self.assertTrue((coverage["valid_start"] == 63).all())
@@ -334,21 +370,34 @@ class TabLifecycleChecks(unittest.TestCase):
             # Exercise the user's original CLI, including CSV loading and report
             # generation, against the same tiny fixture and calibrated checkpoint.
             from ts_benchmark.pipeline import PREDEFINED_DATASETS
-            entry_output = runtime / "original_entry"
-            entry_args = [str(ROOT / "scripts/run_benchmark.py"), "--config-path", "dynamic_neighborhood_stat_label.json",
-                          "--model-name", "self_impl.DynamicNeighborhoodStat", "--data-name-list", "synthetic.csv",
-                          "--model-hyper-params", json.dumps(parameters), "--seed", "42", "--gpus", "0",
-                          "--num-workers", "1", "--timeout", "-1", "--save-path", str(entry_output)]
-            with patch.object(PREDEFINED_DATASETS["large_detect"], "datasrc_class", lambda: LocalDataSource(str(fixture), "META.csv")), \
-                 patch.object(DynamicNeighborhoodStat, "_train", side_effect=AssertionError("original entry unexpectedly retrained")), \
-                 patch.object(sys, "argv", entry_args), patch.object(logging, "basicConfig"), \
-                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                runpy.run_path(str(ROOT / "scripts/run_benchmark.py"), run_name="__main__")
-            entry_reports = list(entry_output.glob("test_report*"))
-            self.assertEqual(len(entry_reports), 1)
-            entry_report = pd.read_csv(entry_reports[0])
-            self.assertEqual(set(entry_report["metric_name"]), {"precision", "recall", "f_score", "fpr", "add"})
-            self.assertTrue(np.isfinite(entry_report.drop(columns=["metric_name", "strategy_args"]).to_numpy(dtype=float)).all())
+            for mode, metrics in (("label", classification_metrics_label.__all__), ("score", classification_metrics_score.__all__)):
+                entry_output = runtime / "original_entry" / mode
+                entry_args = [str(ROOT / "scripts/run_benchmark.py"), "--config-path", "dynamic_neighborhood_stat_" + mode + ".json",
+                              "--model-name", "self_impl.DynamicNeighborhoodStat", "--data-name-list", "synthetic.csv",
+                              "--model-hyper-params", json.dumps(parameters), "--seed", "42", "--gpus", "0",
+                              "--num-workers", "1", "--timeout", "-1", "--save-path", str(entry_output)]
+                with patch.object(PREDEFINED_DATASETS["large_detect"], "datasrc_class", lambda: LocalDataSource(str(fixture), "META.csv")), \
+                     patch.object(DynamicNeighborhoodStat, "_train", side_effect=AssertionError("original entry unexpectedly retrained")), \
+                     patch.object(sys, "argv", entry_args), patch.object(logging, "basicConfig"), \
+                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    runpy.run_path(str(ROOT / "scripts/run_benchmark.py"), run_name="__main__")
+                entry_reports = list(entry_output.glob("test_report*"))
+                self.assertEqual(len(entry_reports), 1)
+                entry_report = pd.read_csv(entry_reports[0])
+                self.assertEqual(set(entry_report["metric_name"]), set(metrics))
+                self.assertEqual(len(entry_report), len(metrics) * (len(ratios) if mode == "label" else 1))
+                self.assertTrue(np.isfinite(entry_report.drop(columns=["metric_name", "strategy_args", "typical_anomaly_ratio"],
+                                                              errors="ignore").to_numpy(dtype=float)).all())
+                # The normal TAB records must be readable CSVs with the same
+                # complete metric columns as the corresponding AT strategy.
+                entry_records = list(entry_output.glob("DynamicNeighborhoodStat.*.csv"))
+                self.assertEqual(len(entry_records), 1)
+                entry_record = pd.read_csv(entry_records[0])
+                self.assertTrue(set(metrics).issubset(entry_record.columns))
+                self.assertTrue((entry_record["log_info"].fillna("") == "").all())
+                if mode == "label":
+                    self.assertEqual(entry_record["typical_anomaly_ratio"].tolist(), ratios)
+                    self.assertEqual(entry_report["typical_anomaly_ratio"].drop_duplicates().tolist(), ratios)
             # Rejected training data must remain attributable and must not turn into imputed results.
             invalid = data.copy()
             invalid.loc[0, "label"] = 1
@@ -388,6 +437,14 @@ class TabLifecycleChecks(unittest.TestCase):
         self.assertEqual(summary.loc[0, "excluded_boundary_events_max"], 2)
         self.assertEqual(summary.loc[0, "coverage_seeds"], 2)
         self.assertEqual(summary.loc[0, "mean"], 0.75)
+        # Ratios must not be averaged together or multiply coverage/entity counts.
+        multi = pd.concat([frame.assign(typical_anomaly_ratio=0.5),
+                           frame.assign(typical_anomaly_ratio=5.0, f_score=0.0)], ignore_index=True)
+        _, grouped_seeds, grouped_summary = launcher.summarize(
+            [(multi, "label", 42, ["f_score"]), (multi.copy(), "label", 43, ["f_score"])], groups)
+        self.assertEqual(grouped_summary["mean"].tolist(), [0.75, 0.0])
+        self.assertTrue((grouped_seeds["valid_points"] == 124).all())
+        self.assertTrue((grouped_seeds["expected_entities"] == 2).all())
         incomplete = frame.copy()
         incomplete.loc[0, list(launcher.COVERAGE_FIELDS)] = np.nan
         incomplete.loc[0, "f_score"] = np.nan
