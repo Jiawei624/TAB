@@ -6,6 +6,7 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .features import Observations
+from .readouts import EncoderReadout
 
 
 def mlp(input_dim, hidden, output_dim):
@@ -41,8 +42,18 @@ class CausalEncoder(nn.Module):
             dilation *= 2
         self.blocks = nn.Sequential(*blocks)
         self.receptive_field = receptive_field
+        self.readout_plans = nn.ModuleDict()
 
-    def forward(self, x):
+    @staticmethod
+    def _readout_key(length, positions):
+        return "{}_{}".format(length, "_".join(map(str, positions)))
+
+    def add_readouts(self, length, positions):
+        self.readout_plans[self._readout_key(length, positions)] = EncoderReadout(length, positions, self.blocks)
+
+    def forward(self, x, readouts=None):
+        if readouts is not None:
+            return self.readout_plans[self._readout_key(x.shape[1], readouts)](x, self)
         x = self.input_projection(x).transpose(1, 2)
         return self.blocks(x).transpose(1, 2)
 
@@ -75,6 +86,55 @@ class DualPathNetwork(nn.Module):
         self.encoder_s = CausalEncoder(1 + emb, config.hidden_s, config.win_size - 1, config.dropout)
         self.stat_head = mlp(config.hidden_s + 2 * emb, hidden, 3)
         self.point_head = mlp(config.hidden_s + emb, hidden, 1)
+        for scale in config.scales:
+            length = config.win_size // scale
+            self.encoder_n.add_readouts(length, (length - 1,))
+        self.self_readouts = tuple(config.win_size - h - 1 for h in config.spans) + (config.win_size - 2,)
+        self.encoder_s.add_readouts(config.win_size - 1, self.self_readouts)
+
+    @staticmethod
+    def _project_parts(layer, *inputs):
+        weights = layer.weight.split([value.shape[-1] for value in inputs], dim=1)
+        return tuple(F.linear(value, weight) for value, weight in zip(inputs, weights))
+
+    def _route_projections(self, encoded, context):
+        """Project each source/target once; nonlinear mixing still sees every pair."""
+        variable, scale = self.variable_n.weight, self.scale_n.weight
+        gi, gj, gm, gh, gc = self._project_parts(self.scale_gate[0], variable, variable, scale, encoded, context)
+        scale_source = gh + gj[None, :, None] + gm[None, None] + self.scale_gate[0].bias
+        scale_target = gc + gi[None]
+        vh, vi, vj, vm = self._project_parts(self.value[0], encoded, variable, variable, scale)
+        value_source = vh + vj[None, :, None] + vm[None, None] + self.value[0].bias
+        emb, message = self.config.embedding_dim, self.config.message_dim
+        wi, wj, _, wc = self.relation[0].weight.split((emb, emb, message, self.config.context_dim), dim=1)
+        relation_target = F.linear(context, wc) + F.linear(variable, wi)[None] + self.relation[0].bias
+        relation_source = F.linear(variable, wj)
+        _, wi, wm = self.decoder_n[0].weight.split((message, emb, emb), dim=1)
+        return (scale_source, scale_target, value_source, vi, relation_target, relation_source,
+                F.linear(variable, wi), F.linear(scale, wm))
+
+    def _route_projected(self, scale_source, scale_target, value_source, value_target,
+                         relation_target, relation_source, decoder_target, decoder_scale, target_ids):
+        scale_hidden = scale_source[:, None] + scale_target[:, target_ids, None, None]
+        weights_scale = torch.softmax(self.scale_gate[2](self.scale_gate[1](scale_hidden)).squeeze(-1)
+                                      / self.config.temperature_scale, dim=-1)
+        value_hidden = value_source[:, None] + value_target[target_ids][None, :, None, None]
+        messages = (weights_scale[..., None] * self.value[2](self.value[1](value_hidden))).sum(dim=-2)
+        emb, message = self.config.embedding_dim, self.config.message_dim
+        wm = self.relation[0].weight[:, 2 * emb:2 * emb + message]
+        relation_hidden = F.linear(messages, wm) + relation_target[:, target_ids, None] + relation_source[None, None]
+        logits = self.relation[2](self.relation[1](relation_hidden)).squeeze(-1) / self.config.temperature_relation
+        self_mask = target_ids[:, None] == torch.arange(self.channels, device=messages.device)[None]
+        attention = torch.softmax(logits.masked_fill(self_mask[None], -torch.inf), dim=-1)
+        aggregate = (attention[..., None] * messages).sum(dim=-2)
+        decoded = F.linear(aggregate, self.decoder_n[0].weight[:, :message], self.decoder_n[0].bias)[:, :, None]
+        decoded = decoded + decoder_target[target_ids][None, :, None] + decoder_scale[None, None]
+        prediction = self.decoder_n[2](self.decoder_n[1](decoded))
+        concentration = attention.topk(self.top_r, dim=-1).values.sum(dim=-1) if self.top_r else attention.sum(dim=-1)
+        magnitude = messages.abs().amax(dim=-1).masked_fill(self_mask[None], 0)
+        diagnostics = torch.stack((magnitude.sum(dim=-1) / (self.channels - 1),
+                                   (magnitude * attention).sum(dim=-1) / (self.channels - 1)), dim=-1)
+        return prediction, concentration, diagnostics
 
     def _route(self, encoded, context, target_ids):
         """A target chunk still normalizes over ALL nonself sources and ALL scales."""
@@ -126,16 +186,23 @@ class DualPathNetwork(nn.Module):
                                   embeddings[None, :, None].expand(batch, channels, blocks, -1),
                                   self.scale_n.weight[index][None, None, None].expand(
                                       batch, channels, blocks, -1)), dim=-1)
-            h = self.encoder_n(sequence.reshape(batch * channels, blocks, -1))[:, -1]
+            h = self.encoder_n(sequence.reshape(batch * channels, blocks, -1),
+                               readouts=(blocks - 1,) if self.config.prune_tcn else None)[:, -1]
             encoded.append(h.reshape(batch, channels, -1))
         encoded = torch.stack(encoded, dim=2)
         variable_context = self.context(encoded.flatten(start_dim=2))
         # A masked sum (rather than total-minus-self) also avoids cancellation by the excluded input.
         context = torch.einsum("ij,bjc->bic", self.context_mask, variable_context)
         predictions, concentrations, diagnostics = [], [], []
+        projected = self._route_projections(encoded, context) if self.config.factorized_routing else None
         for start in range(0, channels, self.config.target_chunk_size):
             ids = torch.arange(start, min(start + self.config.target_chunk_size, channels), device=windows.device)
-            if self.training and self.config.gradient_checkpointing:
+            if projected is not None:
+                if self.training and self.config.gradient_checkpointing:
+                    chunk = checkpoint(self._route_projected, *projected, ids, use_reentrant=False)
+                else:
+                    chunk = self._route_projected(*projected, ids)
+            elif self.training and self.config.gradient_checkpointing:
                 chunk = checkpoint(self._route, encoded, context, ids, use_reentrant=False)
             else:
                 chunk = self._route(encoded, context, ids)
@@ -148,9 +215,13 @@ class DualPathNetwork(nn.Module):
         own_id = self.variable_s.weight
         own_input = torch.cat((history[..., None], own_id[None, :, None].expand(
             batch, channels, self.config.win_size - 1, -1)), dim=-1)
-        own_hidden = self.encoder_s(own_input.reshape(batch * channels, self.config.win_size - 1, -1))
-        own_hidden = own_hidden.reshape(batch, channels, self.config.win_size - 1, -1)
-        states = torch.stack([own_hidden[:, :, self.config.win_size - h - 1] for h in self.config.spans], dim=2)
+        own_hidden = self.encoder_s(own_input.reshape(batch * channels, self.config.win_size - 1, -1),
+                                    readouts=self.self_readouts if self.config.prune_tcn else None)
+        own_hidden = own_hidden.reshape(batch, channels, own_hidden.shape[1], -1)
+        if self.config.prune_tcn:
+            states = own_hidden[:, :, :-1]
+        else:
+            states = torch.stack([own_hidden[:, :, self.config.win_size - h - 1] for h in self.config.spans], dim=2)
         raw = self.stat_head(torch.cat((states,
             own_id[None, :, None].expand(batch, channels, len(self.config.spans), -1),
             self.span_s.weight[None, None].expand(batch, channels, len(self.config.spans), -1)), dim=-1))

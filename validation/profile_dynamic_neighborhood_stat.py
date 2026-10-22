@@ -23,12 +23,79 @@ def synchronize(device):
         torch.cuda.synchronize(device)
 
 
+def profile_network(channels, recompute, implementation, args, device):
+    torch.manual_seed(42)
+    optimized = implementation == "optimized"
+    config = Config(batch_size=args.batch_size, gradient_checkpointing=recompute,
+                    factorized_routing=optimized, prune_tcn=optimized)
+    values = np.random.default_rng(42).normal(size=(config.win_size + args.batch_size, channels))
+    start = time.perf_counter()
+    refs = training_references(values, config)
+    reference_seconds = time.perf_counter() - start
+    model = DualPathNetwork(channels, config, refs).to(device).train()
+    windows = torch.from_numpy(np.stack([values[i:i + config.win_size] for i in range(args.batch_size)])).to(device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    # One warmup, then forward + loss + backward; optimizer and data loading excluded.
+    timings, forward_timings = [], []
+    for step in range(args.steps + 1):
+        model.zero_grad(set_to_none=True)
+        synchronize(device)
+        start = time.perf_counter()
+        with torch.backends.cudnn.flags(enabled=not args.disable_cudnn, benchmark=False, deterministic=True):
+            output = model(windows)
+            loss = model.losses(windows, output)["loss"]
+            if not bool(torch.isfinite(loss)):
+                raise FloatingPointError("Nonfinite profile loss")
+            synchronize(device)
+            forward_seconds = time.perf_counter() - start
+            loss.backward()
+        synchronize(device)
+        elapsed = time.perf_counter() - start
+        if step:
+            timings.append(elapsed)
+            forward_timings.append(forward_seconds)
+        print("implementation={} channels={} checkpointing={} step={}/{}{} elapsed={:.3f}s".format(
+            implementation, channels, recompute, step, args.steps, " warmup" if step == 0 else "", elapsed), flush=True)
+    measurement = {"implementation": implementation, "channels": channels, "gradient_checkpointing": recompute,
+                   "factorized_routing": config.factorized_routing, "prune_tcn": config.prune_tcn,
+                   "reference_seconds": reference_seconds,
+                   "step_seconds": timings, "mean_step_seconds": float(np.mean(timings)),
+                   "mean_forward_seconds": float(np.mean(forward_timings)),
+                   "windows_per_second": args.batch_size / float(np.mean(timings))}
+    if device.type == "cuda":
+        measurement["peak_cuda_allocated_bytes"] = torch.cuda.max_memory_allocated(device)
+    del loss, output
+    model.zero_grad(set_to_none=True)
+    model.eval()
+    inference_timings = []
+    with torch.no_grad(), torch.backends.cudnn.flags(enabled=not args.disable_cudnn, benchmark=False, deterministic=True):
+        for step in range(args.steps + 1):
+            synchronize(device)
+            start = time.perf_counter()
+            output = model(windows)
+            synchronize(device)
+            if step:
+                inference_timings.append(time.perf_counter() - start)
+            del output
+    measurement["inference_seconds"] = inference_timings
+    measurement["mean_inference_seconds"] = float(np.mean(inference_timings))
+    measurement["inference_windows_per_second"] = args.batch_size / float(np.mean(inference_timings))
+    # Arithmetic extrapolation for context only; server hardware will differ.
+    if channels == 51 and config.win_size == 128:
+        measurement["swat_train_batches_per_epoch"] = (396000 - 128 + 1 + args.batch_size - 1) // args.batch_size
+        measurement["swat_train_only_seconds_per_epoch_estimate"] = measurement["swat_train_batches_per_epoch"] * measurement["mean_step_seconds"]
+    return measurement
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--channels", nargs="+", type=int, default=[3, 51])
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--implementation", choices=("optimized", "reference", "both"), default="optimized",
+                        help="Select A1+A2b or the original computation, with identical model dimensions")
     parser.add_argument("--disable-cudnn", action="store_true", help="Compare against TAB's inherited cuDNN-disabled setting")
     parser.add_argument("--cpu-threads", type=int, default=3)
     parser.add_argument("--output", default="result/DynamicNeighborhoodStat/diagnosis/profile.json")
@@ -44,53 +111,13 @@ def main():
     if device.type == "cuda":
         report["gpu"] = torch.cuda.get_device_name(device)
     print(json.dumps({key: value for key, value in report.items() if key != "measurements"}), flush=True)
+    implementations = ("reference", "optimized") if args.implementation == "both" else (args.implementation,)
     for channels in args.channels:
-        for recompute in (True, False):
-            torch.manual_seed(42)
-            config = Config(batch_size=args.batch_size, gradient_checkpointing=recompute)
-            values = np.random.default_rng(42).normal(size=(config.win_size + args.batch_size, channels))
-            start = time.perf_counter()
-            refs = training_references(values, config)
-            reference_seconds = time.perf_counter() - start
-            model = DualPathNetwork(channels, config, refs).to(device).train()
-            windows = torch.from_numpy(np.stack([values[i:i + config.win_size] for i in range(args.batch_size)])).to(device)
-            if device.type == "cuda":
-                torch.cuda.reset_peak_memory_stats(device)
-            # Include one warmup, then time full forward + loss + backward steps.
-            timings, forward_timings = [], []
-            for step in range(args.steps + 1):
-                model.zero_grad(set_to_none=True)
-                synchronize(device)
-                start = time.perf_counter()
-                with torch.backends.cudnn.flags(enabled=not args.disable_cudnn, benchmark=False, deterministic=True):
-                    output = model(windows)
-                    loss = model.losses(windows, output)["loss"]
-                    if not bool(torch.isfinite(loss)):
-                        raise FloatingPointError("Nonfinite profile loss")
-                    synchronize(device)
-                    forward_seconds = time.perf_counter() - start
-                    loss.backward()
-                synchronize(device)
-                elapsed = time.perf_counter() - start
-                if step:
-                    timings.append(elapsed)
-                    forward_timings.append(forward_seconds)
-                print("channels={} checkpointing={} step={}/{}{} elapsed={:.3f}s".format(
-                    channels, recompute, step, args.steps, " warmup" if step == 0 else "", elapsed), flush=True)
-            measurement = {"channels": channels, "gradient_checkpointing": recompute,
-                           "reference_seconds": reference_seconds,
-                           "step_seconds": timings, "mean_step_seconds": float(np.mean(timings)),
-                           "mean_forward_seconds": float(np.mean(forward_timings)),
-                           "windows_per_second": args.batch_size / float(np.mean(timings))}
-            if device.type == "cuda":
-                measurement["peak_cuda_allocated_bytes"] = torch.cuda.max_memory_allocated(device)
-            # Arithmetic extrapolation for context only; server hardware will differ.
-            if channels == 51 and config.win_size == 128:
-                measurement["swat_train_batches_per_epoch"] = (396000 - 128 + 1 + args.batch_size - 1) // args.batch_size
-                measurement["swat_train_only_seconds_per_epoch_estimate"] = measurement["swat_train_batches_per_epoch"] * measurement["mean_step_seconds"]
-            report["measurements"].append(measurement)
-            print(json.dumps(measurement), flush=True)
-            del loss, output, model, windows
+        for implementation in implementations:
+            for recompute in (True, False):
+                measurement = profile_network(channels, recompute, implementation, args, device)
+                report["measurements"].append(measurement)
+                print(json.dumps(measurement), flush=True)
     path = Path(args.output)
     if not path.is_absolute():
         path = ROOT / path

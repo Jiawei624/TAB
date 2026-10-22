@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import BatchSampler, DataLoader, Dataset, RandomSampler, SequentialSampler
 
 from ts_benchmark.common.constant import ROOT_PATH
 from .config import Config
@@ -28,18 +28,28 @@ class WindowDataset(Dataset):
     def __init__(self, values, length):
         if length <= 0 or len(values) < length:
             raise ValueError("A window must fit entirely inside its input segment")
-        self.values, self.length = values, length
+        # Normalize the layout once, rather than copying each overlapping window.
+        self.values, self.length = np.ascontiguousarray(values), length
+        self.offsets = np.arange(length)
 
     def __len__(self):
         return len(self.values) - self.length + 1
 
     def __getitem__(self, index):
+        if isinstance(index, (list, tuple, np.ndarray)):
+            indices = np.asarray(index)
+            if indices.ndim != 1 or not len(indices) or not np.issubdtype(indices.dtype, np.integer):
+                raise IndexError("A batch must contain integer window indices")
+            if indices.min() < 0 or indices.max() >= len(self):
+                raise IndexError("Window index is outside its input segment")
+            # One contiguous batch allocation; no per-window copy followed by stack.
+            return torch.from_numpy(self.values[indices[:, None] + self.offsets[None]])
         if index < 0 or index >= len(self):
             raise IndexError("Window index is outside its input segment")
         window = self.values[index:index + self.length]
         if len(window) != self.length:
             raise RuntimeError("A window crossed the boundary of its input segment")
-        return np.ascontiguousarray(window)
+        return window
 
 
 def window_split_metadata(train_length, validation_length, window_length):
@@ -127,8 +137,11 @@ class DynamicNeighborhoodStat:
 
     def _loader(self, values, training=False):
         generator = torch.Generator().manual_seed(self.config.seed)
-        return DataLoader(WindowDataset(values, self.config.win_size), batch_size=self.config.batch_size,
-                          shuffle=training, drop_last=False, num_workers=self.config.num_workers,
+        dataset = WindowDataset(values, self.config.win_size)
+        sampler = RandomSampler(dataset, generator=generator) if training else SequentialSampler(dataset)
+        batches = BatchSampler(sampler, self.config.batch_size, drop_last=False)
+        # Passing whole batches through the sampler disables per-item collate/stack.
+        return DataLoader(dataset, batch_size=None, sampler=batches, num_workers=self.config.num_workers,
                           pin_memory=self.device_.type == "cuda", generator=generator)
 
     def _progress(self, stage, total):
@@ -144,6 +157,7 @@ class DynamicNeighborhoodStat:
                    "batch_size": self.config.batch_size, "win_size": self.config.win_size,
                    "target_chunk_size": self.config.target_chunk_size,
                    "gradient_checkpointing": self.config.gradient_checkpointing,
+                   "factorized_routing": self.config.factorized_routing, "prune_tcn": self.config.prune_tcn,
                    "num_workers": self.config.num_workers}
         if self.device_.type == "cuda":
             runtime["gpu"] = torch.cuda.get_device_name(self.device_)
@@ -223,7 +237,9 @@ class DynamicNeighborhoodStat:
     def _epoch(self, loader, optimizer=None, stage=None):
         training = optimizer is not None
         self.model.train(training)
-        totals, count = {}, 0
+        names = ("loss", "reconstruction", "loss_n", "loss_s", "regularizer",
+                 "concentration_mean", "concentration_exceed_fraction", "concentration_excess")
+        totals, count = torch.zeros(len(names), dtype=torch.float64, device=self.device_), 0
         with torch.set_grad_enabled(training), self._progress(stage or ("train" if training else "validation"), len(loader)) as progress:
             for batch_index, windows in enumerate(loader, 1):
                 windows = windows.to(self.device_, non_blocking=True)
@@ -238,15 +254,14 @@ class DynamicNeighborhoodStat:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip, error_if_nonfinite=True)
                     optimizer.step()
                 concentration = output["concentration"].detach()
-                row = {name: float(value.detach()) for name, value in losses.items()}
-                row.update(concentration_mean=float(concentration.mean()),
-                           concentration_exceed_fraction=float((concentration > self.model.rho_a).float().mean()),
-                           concentration_excess=float(torch.relu(concentration - self.model.rho_a).mean()))
-                for name, value in row.items():
-                    totals[name] = totals.get(name, 0.0) + value * len(windows)
+                metrics = [losses[name].detach().to(torch.float64) for name in names[:5]]
+                metrics.extend(value.to(torch.float64) for value in (
+                    concentration.mean(), (concentration > self.model.rho_a).float().mean(),
+                    torch.relu(concentration - self.model.rho_a).mean()))
+                totals.add_(torch.stack(metrics) * len(windows))
                 count += len(windows)
-                progress.update(batch_index, "windows={} loss={:.6g}".format(count, row["loss"]))
-        return {name: value / count for name, value in totals.items()}
+                progress.update(batch_index, lambda: "windows={} loss={:.6g}".format(count, float(losses["loss"].detach())))
+        return dict(zip(names, (totals / count).cpu().tolist()))
 
     def _train(self, train, validation):
         train_loader, validation_loader = self._loader(train, True), self._loader(validation)
@@ -312,7 +327,10 @@ class DynamicNeighborhoodStat:
         token = uuid.uuid4().hex
         errors_path, c_path = self.run_dir_ / (".errors_" + token), self.run_dir_ / (".concentration_" + token)
         errors = concentrations = None
-        model_error, mean_error, message_sum, offset = np.zeros(channels), np.zeros(channels), np.zeros(2), 0
+        model_error = torch.zeros(channels, dtype=torch.float64, device=self.device_)
+        mean_error = torch.zeros_like(model_error)
+        message_sum = torch.zeros(2, dtype=torch.float64, device=self.device_)
+        offset = 0
         self.model.eval()
         try:
             errors = np.memmap(errors_path, dtype=np.float64, mode="w+", shape=(count, channels, coordinates))
@@ -328,12 +346,13 @@ class DynamicNeighborhoodStat:
                     errors[offset:stop] = packed
                     concentrations[offset:stop] = output["concentration"].cpu().numpy()
                     normalizer = self.model.variance_n.clamp_min(self.config.epsilon_v)
-                    model_error += (residual_errors[0] / normalizer).mean(dim=(-2, -1)).sum(dim=0).cpu().numpy()
-                    mean_error += ((output["target_n"] - self.model.mean_n).square() / normalizer).mean(dim=(-2, -1)).sum(dim=0).cpu().numpy()
-                    message_sum += output["message_diagnostics"].sum(dim=(0, 1)).cpu().numpy()
+                    model_error.add_((residual_errors[0] / normalizer).mean(dim=(-2, -1)).sum(dim=0))
+                    mean_error.add_(((output["target_n"] - self.model.mean_n).square() / normalizer).mean(dim=(-2, -1)).sum(dim=0))
+                    message_sum.add_(output["message_diagnostics"].sum(dim=(0, 1)).to(torch.float64))
                     offset = stop
                     progress.update(batch_index, "windows={}".format(offset))
-            self.support_model_error_, self.support_mean_error_ = model_error / count, mean_error / count
+            self.support_model_error_, self.support_mean_error_ = (torch.stack((model_error, mean_error)) / count).cpu().numpy()
+            message_sum = message_sum.cpu().numpy()
             self.support_gain_ = (self.support_mean_error_ - self.support_model_error_) / np.maximum(self.support_mean_error_, self.config.epsilon_g)
             self.support_ = (self.support_mean_error_ > self.config.epsilon_g) & (self.support_gain_ >= self.config.eta_g)
             # Each quantile is exact; only a single coordinate is copied to RAM at a time.
@@ -477,7 +496,8 @@ class DynamicNeighborhoodStat:
             variable = np.lib.format.open_memmap(variable_path, mode="w+", dtype=np.float64, shape=values.shape)
             variable[:self.config.win_size - 1] = np.nan
         offset = self.config.win_size - 1
-        c_sum, c_exceed, c_excess, c_count = 0.0, 0.0, 0.0, 0
+        concentration_totals = torch.zeros(3, dtype=torch.float64, device=self.device_)
+        c_count = 0
         self.model.eval()
         try:
             loader = self._loader(normalized)
@@ -491,9 +511,8 @@ class DynamicNeighborhoodStat:
                     if variable is not None:
                         variable[offset:stop] = variable_scores
                     c = output["concentration"]
-                    c_sum += float(c.sum())
-                    c_exceed += float((c > self.model.rho_a).sum())
-                    c_excess += float(torch.relu(c - self.model.rho_a).sum())
+                    concentration_totals.add_(torch.stack((c.sum().to(torch.float64),
+                        (c > self.model.rho_a).sum().to(torch.float64), torch.relu(c - self.model.rho_a).sum().to(torch.float64))))
                     c_count += c.numel()
                     offset = stop
                     progress.update(batch_index, "scored={}/{}".format(offset - self.config.win_size + 1, len(loader.dataset)))
@@ -503,6 +522,7 @@ class DynamicNeighborhoodStat:
                 variable._mmap.close()
         if not np.isfinite(scores[self.evaluation_valid_mask_]).all():
             raise FloatingPointError("Nonfinite valid test scores")
+        c_sum, c_exceed, c_excess = concentration_totals.cpu().tolist()
         alarms = np.zeros(len(values), dtype=np.int8)
         alarms[self.evaluation_valid_mask_] = (scores[self.evaluation_valid_mask_] > self.threshold_).astype(np.int8)
         pd.DataFrame({"position": np.arange(len(values)), "input_index": test_data.index,

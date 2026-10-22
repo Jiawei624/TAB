@@ -94,7 +94,13 @@ SWAT 在默认配置下每轮包含 12,372 个训练批次和 3,090 个验证批
 uv run python -u validation/profile_dynamic_neighborhood_stat.py --channels 51 --steps 3 --device cuda:0
 ```
 
-脚本保留默认 L=128 和 batch size=32，分别测量启用和关闭梯度重计算时的前向、反向耗时。添加 `--disable-cudnn --output result/DynamicNeighborhoodStat/diagnosis/profile_no_cudnn.json` 可测量 cuDNN 关闭时的速度。这里的整轮耗时外推仅用于诊断，不代表完整训练结果。
+脚本保留默认 L=128 和 batch size=32，分别测量启用和关闭梯度重计算时的训练批次与推理耗时。训练计时包含前向、损失和反向，不包含优化器更新与数据加载；推理计时仅包含网络前向。添加 `--disable-cudnn --output result/DynamicNeighborhoodStat/diagnosis/profile_no_cudnn.json` 可测量 cuDNN 关闭时的速度。这里的整轮耗时外推仅用于诊断，不代表完整训练结果。
+
+同一设备比较原计算路径和 A1+A2b：
+
+```bash
+uv run python -u validation/profile_dynamic_neighborhood_stat.py --channels 51 --steps 3 --device cuda:0 --implementation both --output result/DynamicNeighborhoodStat/diagnosis/profile_comparison.json
+```
 
 真实 SWAT 的少量连续点可用于两轮流程测试：
 
@@ -135,6 +141,31 @@ python scripts/run_dynamic_neighborhood_stat.py --data-name-list SWAT.csv --seed
 `calibration.json` 的 `freeze_energy` 按变量和统计跨度记录 `margin = a_low - log(energy_floor)`、`has_positive_bound` 及 `energy_squared_error_lower_bound = max(margin,0)^2`。这是完全冻结/线性化片段的原始 A 坐标平方误差下界，不是整体分数或必然报警的保证。margin=0 时没有正下界，正常训练包含合法冻结状态时可能出现这种情况。观测目标保留原值；近常量坐标的预测使用固定训练参考值。
 
 已有校准检查点可以直接复用；通过 `detect_fit` 复用时，诊断报告依据实际输入和已有参考统计写出，无须重新训练或改变阈值。
+
+## 计算优化
+
+默认启用 A1、A2b 和 A3，保留全部变量、尺度、统计跨度、网络宽度和 stride=1。各项实现如下：
+
+| 优化 | 实现 | 保持的约束 |
+|---|---|---|
+| A1 | 将路由 MLP 首层的拼接线性投影分解为来源项和目标项，提前计算并在目标分块间复用 | 先相加再经过原 GELU；尺度与邻域 softmax 的范围不变 |
+| A2b | 从邻域末点、自身统计头及末点头反向追踪依赖，只计算所需 TCN 状态 | 使用原卷积权重、偏置和逐层零填充；保留残差、LayerNorm、GELU 和 dropout |
+| A3 | 输入数组一次转连续布局，按批次收集窗口；损失和诊断量在设备上累计，在阶段结束或实际输出日志时读取 | 保留原采样顺序、最后一批、误差与校准公式，以及非有限值检查 |
+
+L=128 时，邻域各尺度的卷积输出位置合计由 504 降至 186，自身路径由 1524 降至 600。它们是计算位置计数，不是实测加速倍数。A2b 依赖计划使用不写入检查点的索引缓冲区，参数名称和形状与原模型一致。
+
+`factorized_routing=true` 控制 A1，`prune_tcn=true` 控制 A2b；均可通过 `--model-hyper-params` 设置为 `false` 做原路径对照。这两个执行选项不改变检查点身份，旧检查点缺少它们时按默认值加载。比较训练耗时时应同时传入 `"reuse_checkpoint":false`，避免复用已完成的训练。A3 始终启用。
+
+浮点累加顺序和 dropout 随机数的使用顺序会变化，同一随机种子不保证产生逐位相同的训练轨迹。验证在关闭 dropout 时分别检查双精度组件等价性及单精度全网络输出和梯度；正常训练仍使用默认 dropout=0.1。服务器 GPU 的实际速度和数值表现需以该设备运行结果为准。
+
+本地诊断使用 PyTorch 2.12.0+cpu、3 个 CPU 线程，合成 51 变量窗口，L=128、batch size=32、默认梯度重计算；每条路径预热一批，测量三批均值：
+
+| 网络计算 | 原路径 | A1+A2b | 加速倍数 |
+|---|---|---|---|
+| 前向、损失及反向 | 3.530 秒/批 | 1.666 秒/批 | 2.12 |
+| 推理前向 | 0.693 秒/批 | 0.419 秒/批 | 1.65 |
+
+原始计时保存在 `result/DynamicNeighborhoodStat/diagnosis/profile_a1_a2b_a3_cpu.json`，不包含 A3 数据加载与阶段统计的收益。真实 SWAT 的 3 变量、800 训练点与 192 测试点流程测试完成两轮训练和校准，耗时 4.54 秒；65 个有效测试分数均有限，检查点重载评分一致。其记录位于 `result/DynamicNeighborhoodStat/diagnosis/swat_smoke_optimized/smoke_report.json`。这些结果仅验证本地可运行性和计算耗时，不代表检测效果或 GPU 加速倍数。
 
 ## 时间对齐与指标
 
@@ -193,6 +224,7 @@ valid = detector.evaluation_valid_mask_
 
 ```bash
 python validation/validate_dynamic_neighborhood_stat.py
+python validation/validate_dynamic_neighborhood_optimizations.py
 ```
 
-验证覆盖目标公式、参考统计、输入排除的梯度和扰动检查、零方差坐标的固定输出和梯度、固定坐标的评分一致性、条件性冻结误差下界，以及训练/验证构窗边界。微型生命周期验证覆盖训练、顺序校准、旧检查点复用、TAB 入口和评价覆盖汇总。合成运行只验证代码，不作为检测效果证据；完整数据训练在服务器进行。
+验证覆盖目标公式、参考统计、输入排除的梯度和扰动检查、零方差坐标的固定输出和梯度、固定坐标的评分一致性、条件性冻结误差下界，以及训练/验证构窗边界。微型生命周期验证覆盖训练、顺序校准、旧检查点复用、TAB 入口和评价覆盖汇总。优化验证覆盖 A1/A2b 独立与组合路径的输出及梯度、逐层填充、TCN 计算位置数，以及连续两轮采样顺序和末批保留。合成运行只验证代码，不作为检测效果证据；完整数据训练在服务器进行。

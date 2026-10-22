@@ -43,6 +43,8 @@ class Config:
     num_workers: int = 0
     target_chunk_size: int = 16
     gradient_checkpointing: bool = True
+    factorized_routing: bool = True
+    prune_tcn: bool = True
     reference_chunk_size: int = 8192
     log_interval_seconds: float = 30.0
     seed: int = 42
@@ -64,6 +66,9 @@ class Config:
             raise ValueError("win_size must be a multiple of 32 and at least 64")
         if not isinstance(self.num_workers, int) or self.num_workers < 0:
             raise ValueError("num_workers must be a nonnegative integer")
+        for name in ("factorized_routing", "prune_tcn"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError("{} must be boolean".format(name))
         for name in ("train_ratio", "chi", "alpha", "eta_g", "zeta_error", "zeta_threshold"):
             if not 0 < getattr(self, name) < 1:
                 raise ValueError("{} must lie in (0, 1)".format(name))
@@ -94,5 +99,6 @@ class Config:
         """Runtime placement/output choices do not change the fitted detector."""
         ignored = {"device", "artifact_dir", "reuse_checkpoint", "save_variable_scores",
                    "num_workers", "target_chunk_size", "gradient_checkpointing",
-                   "reference_chunk_size", "sample_interval_seconds", "log_interval_seconds"}
+                   "reference_chunk_size", "sample_interval_seconds", "log_interval_seconds",
+                   "factorized_routing", "prune_tcn"}
         return {key: value for key, value in self.to_dict().items() if key not in ignored}

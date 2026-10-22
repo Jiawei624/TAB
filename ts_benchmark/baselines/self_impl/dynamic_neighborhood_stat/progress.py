@@ -26,7 +26,7 @@ class StageProgress:
         if self.first_update or completed == self.total or now - self.last_logged >= self.interval:
             self.first_update = False
             self.status = "completed" if completed == self.total else "running"
-            self._emit(detail)
+            self._emit(detail() if callable(detail) else detail)
 
     def _emit(self, detail=""):
         now = time.perf_counter()
