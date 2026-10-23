@@ -121,6 +121,22 @@ nohup uv run python -u ./scripts/run_benchmark.py \
 
 SWAT 在默认配置下每轮包含 12,372 个训练批次和 3,090 个验证批次。一条 `epoch=1` 汇总表示第一轮训练和验证均已完成；下一条整轮汇总需要等待第二轮的全部批次。阶段日志中的 ETA 根据当前实测速率计算。
 
+### score 指标计算与进度
+
+score 流程依次执行检查点加载、测试推理和六项指标计算。出现 `Reusing calibrated checkpoint:` 表示已跳过训练；出现 `test inference completed` 只表示测试分数生成结束。随后 Range AUC 和 VUS 使用 NumPy 在 CPU 上计算，评价 CSV 在全部指标完成后生成。
+
+Range AUC 保留原有 250 个排序阈值和 `score >= threshold` 判定。VUS 保留从 0 到两倍异常段长度中位数的全部整数窗口，每个窗口使用相同的 250 个阈值。实现对分数排序一次，通过累计权重和异常段最大分数计算阈值结果，保留原有缓冲权重、事件存在奖励及曲面积分公式。没有截断窗口或对评价点采样。
+
+一次评价中的 `R_AUC_ROC/R_AUC_PR` 和 `VUS_ROC/VUS_PR` 分别共享计算，缓存不跨数据文件、比例或评价调用复用。仅计算指标时不构造绘图曲面数组；`generate_curve` 仍支持完整曲面输出。VUS 日志显示点数、阈值数和窗口总数，在首个窗口、每约 30 秒及最后一个窗口报告进度和 ETA。日志中的 `Reusing shared VUS ROC/PR calculation` 表示复用同一次评价的曲面结果。
+
+指标一致性检查及简短 CPU 耗时对照：
+
+```bash
+python validation/validate_score_metrics.py --benchmark
+```
+
+本地 20,000 点、129 个窗口、每窗 250 个阈值的合成对照中，原公式逐阈值扫描耗时 3.074 秒，累计量计算耗时 0.045 秒，两项 VUS 的最大绝对差为 `2.22e-16`。使用真实 SWaT 测试标签和合成分数进行规模检查时，449,792 个有效点、889 个窗口的六项指标总耗时约 5.83 秒；与原公式对照的单窗口完整曲线最大绝对差约 `1.79e-14`。该检查没有训练模型，不代表检测效果或服务器耗时保证；记录见 `result/DynamicNeighborhoodStat/diagnosis/score_metrics_cpu.json`。
+
 仅用几批 51 变量的合成窗口检查服务器速度和设备：
 
 ```bash
@@ -302,11 +318,75 @@ alarms, _ = detector.detect_label(test_dataframe)
 valid = detector.evaluation_valid_mask_
 ```
 
+## 完整流程参数组合搜索
+
+`scripts/search_dynamic_neighborhood_stat.py` 顺序启动原 `scripts/run_benchmark.py`，每组完成原训练、验证、校准、测试和报表流程。默认参数如下：
+
+| 参数 | 候选值 |
+|---|---|
+| `beta` | `0.1, 0.3, 1, 3` |
+| `alpha` | `0.25, 0.5, 0.75` |
+| `eta_g` | `0.01, 0.05, 0.1` |
+| `zeta_error` | `0.90, 0.95, 0.99` |
+
+共 108 组。固定参数为 `batch_size=128`、`learning_rate=0.001`、`win_size=128`、`num_epochs=50`、`patience=7`，默认数据为 `SWAT.csv`、种子为 42、物理 GPU 为 1、评价 worker 为 1、timeout 为 -1。原 label 配置继续输出十组比例的全部指标；搜索汇总仅提取 `typical_anomaly_ratio=0.1`，不会缩减训练数据或修改划分。
+
+在 `TAB/` 仓库目录启动：
+
+```bash
+mkdir -p log
+nohup uv run python -u scripts/search_dynamic_neighborhood_stat.py \
+  --gpus 1 --resume \
+  > ./log/dynamic_neighborhood_stat_grid_driver.log 2>&1 &
+```
+
+只生成待执行命令以供检查：
+
+```bash
+uv run python scripts/search_dynamic_neighborhood_stat.py --gpus 1 --dry-run
+```
+
+搜索范围可通过 `--beta-values`、`--alpha-values`、`--eta-g-values`、`--zeta-error-values` 设置。例如仅比较三种融合比例：
+
+```bash
+uv run python -u scripts/search_dynamic_neighborhood_stat.py \
+  --beta-values 1 --alpha-values 0.25 0.5 0.75 \
+  --eta-g-values 0.05 --zeta-error-values 0.95 \
+  --save-root label/DynamicNeighborhoodStat_alpha_grid --gpus 1 --resume
+```
+
+`--model-hyper-params` 接收固定超参数的完整 JSON，四个搜索字段由候选值覆盖。`--start-index` 和 `--end-index` 指定从 1 开始、包含两端的组合区间，可分批运行同一个网格；汇总保留同配置下之前批次的记录。候选值改变后建议使用不同的 `--save-root`。
+
+默认输出：
+
+```text
+log/dynamic_neighborhood_stat_grid/SWAT_seed42/
+  trial_001_b0p1_a0p25_g0p01_q0p9_<运行标识>.log
+result/label/DynamicNeighborhoodStat_grid/SWAT_seed42/
+  commands.json
+  commands.sh
+  summary_ratio_0p1.csv
+  ranking_ratio_0p1.csv
+  best_ratio_0p1.json
+  trial_001_b0p1_a0p25_g0p01_q0p9/
+    trial.json
+    DynamicNeighborhoodStat.<时间戳>.<主机名>.<进程号>.csv
+    test_report.<时间戳>.<主机名>.<进程号>.csv
+```
+
+每组日志名包含编号、四个参数及运行标识，重跑不会覆盖旧日志。`commands.sh` 保存本次区间的顺序执行命令，重放该文件会执行整个所列区间；需要恢复搜索时使用 Python 入口的 `--resume`。
+
+`summary_ratio_0p1.csv` 保留成功与失败记录。`ranking_ratio_0p1.csv` 按数据文件分别排名，使用原始 `f_score` 降序，平分时依次比较较低的 FPR、较低的 ADD 和组合编号；`best_ratio_0p1.json` 保存每个数据文件的首选组合。每完成一组即更新汇总。排序依据是官方测试结果，适用于探索选参；独立泛化评价需另保留未参与选参的数据。
+
+默认保留原模型的检查点复用规则，不同评分参数会进入不同配置目录；已有匹配检查点时继续复用。需要每组重新训练时，在完整的固定超参数 JSON 中加入 `"reuse_checkpoint":false`。`--resume` 另用于跳过已有成功结果且命令、参数和评价配置一致的组合。失败组合默认继续后续运行，并在本批结束后返回非零退出码；`--stop-on-error` 可在首个失败组合后停止。进程退出码、目标比例记录和该行 `log_info` 都会检查，旧 CSV 不会替代新一次运行的失败结果。
+
 ## 实现验证
 
 ```bash
 python validation/validate_dynamic_neighborhood_stat.py
 python validation/validate_dynamic_neighborhood_optimizations.py
+python validation/validate_dynamic_neighborhood_grid.py
+python validation/validate_score_metrics.py
 ```
 
 验证覆盖目标公式、参考统计、输入排除的梯度和扰动检查、零方差坐标的固定输出和梯度、固定坐标的评分一致性、条件性冻结误差下界，以及训练/验证构窗边界。微型生命周期验证覆盖训练、顺序校准、旧检查点补齐验证分数、十组标签共用一次推理、原 TAB 入口的多比例 CSV/报表及按比例覆盖汇总。优化验证覆盖 A1/A2b 独立与组合路径的输出及梯度、逐层填充、TCN 计算位置数，以及连续两轮采样顺序和末批保留。合成运行只验证代码，不作为检测效果证据；完整数据训练在服务器进行。

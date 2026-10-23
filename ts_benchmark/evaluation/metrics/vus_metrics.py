@@ -14,8 +14,51 @@
 
 """
 from sklearn import metrics
+import logging
 import numpy as np
 import math
+import time
+
+
+logger = logging.getLogger(__name__)
+
+
+class _RangeScoreIndex:
+    """Evaluate the original 250 thresholds without rescanning N points each time."""
+
+    def __init__(self, score):
+        self.score = np.asarray(score)
+        if self.score.ndim != 1 or not len(self.score) or not np.isfinite(self.score).all():
+            raise ValueError("Range AUC requires a nonempty finite one-dimensional score array")
+        self.order = np.argsort(-self.score)
+        descending = self.score[self.order]
+        self.thresholds = descending[np.linspace(0, len(score) - 1, 250).astype(int)]
+        # The legacy comparison is >=, so include every tie at each threshold.
+        self.counts = np.searchsorted(-descending, -self.thresholds, side="right")
+
+    def curve(self, labels, positive_count, ranges):
+        if len(labels) != len(self.score):
+            raise ValueError("Range AUC labels and scores must have the same length")
+        if not ranges:
+            raise ValueError("Range AUC requires at least one anomaly segment")
+        weighted_tp = np.cumsum(labels[self.order], dtype=np.float64)[self.counts - 1]
+        positive_mass = (positive_count + np.sum(labels)) / 2
+        recall = np.minimum(weighted_tp / positive_mass, 1)
+        # All weights inside a nonzero segment are positive. A segment is hit
+        # exactly when its maximum score reaches the current >= threshold.
+        maxima = np.sort([np.max(self.score[begin:end + 1]) for begin, end in ranges])
+        existence = (len(ranges) - np.searchsorted(maxima, self.thresholds, side="left")) / len(ranges)
+        tpr = np.r_[0, recall * existence, 1]
+        fpr = np.r_[0, (self.counts - weighted_tp) / (len(labels) - positive_mass), 1]
+        precision = np.r_[1, weighted_tp / self.counts]
+        return tpr, fpr, precision
+
+
+def _range_areas(tpr, fpr, precision):
+    # Retain TAB's trapezoids and its final forced ROC endpoint (1, 1).
+    auc = np.sum((fpr[1:] - fpr[:-1]) * (tpr[1:] + tpr[:-1]) / 2)
+    ap = np.sum((tpr[1:-1] - tpr[:-2]) * (precision[1:] + precision[:-1]) / 2)
+    return auc, ap
 
 
 class metricor:
@@ -224,32 +267,11 @@ class metricor:
         input: arrays of binary values 
         output: list of ordered pair [[a0,b0], [a1,b1]... ] of the inputs
         """
-        L = []
-        i = 0
-        j = 0
-        while j < len(label):
-            # print(i)
-            while label[i] == 0:
-                i += 1
-                if i >= len(label):
-                    break
-            j = i + 1
-            # print('j'+str(j))
-            if j >= len(label):
-                if j == len(label):
-                    L.append((i, j - 1))
-
-                break
-            while label[j] != 0:
-                j += 1
-                if j >= len(label):
-                    L.append((i, j - 1))
-                    break
-            if j >= len(label):
-                break
-            L.append((i, j - 1))
-            i = j
-        return L
+        values = np.asarray(label)
+        if values.ndim != 1:
+            raise ValueError("Anomaly segments require one-dimensional labels")
+        edges = np.flatnonzero(np.diff(np.r_[False, values != 0, False]))
+        return list(zip(edges[::2].tolist(), (edges[1::2] - 1).tolist()))
 
     def existence_reward(self, labels, preds):
         """
@@ -272,9 +294,9 @@ class metricor:
                 count += 1
         return count
 
-    def extend_postive_range(self, x, window=5):
+    def extend_postive_range(self, x, window=5, *, ranges=None):
         label = x.copy().astype(float)
-        L = self.range_convers_new(label)  # index of non-zero segments
+        L = self.range_convers_new(label) if ranges is None else ranges
         length = len(label)
         for k in range(len(L)):
             s = L[k][0]
@@ -286,7 +308,7 @@ class metricor:
             x2 = np.arange(max(s - window // 2, 0), s)
             label[x2] += np.sqrt(1 - (s - x2) / (window))
 
-        label = np.minimum(np.ones(length), label)
+        np.minimum(label, 1, out=label)
         return label
 
     def extend_postive_range_individual(self, x, percentage=0.2):
@@ -344,10 +366,11 @@ class metricor:
         return TPR_RangeAUC, FPR_RangeAUC, Precision_RangeAUC
 
     def RangeAUC(
-        self, labels, score, window=0, percentage=0, plot_ROC=False, AUC_type="window"
+        self, labels, score, window=0, percentage=0, plot_ROC=False, AUC_type="window",
+        *, _score_index=None,
     ):
         # AUC_type='window'/'percentage'
-        score_sorted = -np.sort(-score)
+        score_index = _RangeScoreIndex(score) if _score_index is None else _score_index
 
         P = np.sum(labels)
         # print(np.sum(labels))
@@ -358,34 +381,8 @@ class metricor:
 
         # print(np.sum(labels))
         L = self.range_convers_new(labels)
-        TPR_list = [0]
-        FPR_list = [0]
-        Precision_list = [1]
-
-        for i in np.linspace(0, len(score) - 1, 250).astype(int):
-            threshold = score_sorted[i]
-            # print('thre='+str(threshold))
-            pred = score >= threshold
-            TPR, FPR, Precision = self.TPR_FPR_RangeAUC(labels, pred, P, L)
-
-            TPR_list.append(TPR)
-            FPR_list.append(FPR)
-            Precision_list.append(Precision)
-
-        TPR_list.append(1)
-        FPR_list.append(1)  # otherwise, range-AUC will stop earlier than (1,1)
-
-        tpr = np.array(TPR_list)
-        fpr = np.array(FPR_list)
-        prec = np.array(Precision_list)
-
-        width = fpr[1:] - fpr[:-1]
-        height = (tpr[1:] + tpr[:-1]) / 2
-        AUC_range = np.sum(width * height)
-
-        width_PR = tpr[1:-1] - tpr[:-2]
-        height_PR = (prec[1:] + prec[:-1]) / 2
-        AP_range = np.sum(width_PR * height_PR)
+        tpr, fpr, prec = score_index.curve(labels, P, L)
+        AUC_range, AP_range = _range_areas(tpr, fpr, prec)
 
         if plot_ROC:
             return AUC_range, AP_range, fpr, tpr, prec
@@ -393,8 +390,8 @@ class metricor:
         return AUC_range
 
     # TPR_FPR_window
-    def RangeAUC_volume(self, labels_original, score, windowSize):
-        score_sorted = -np.sort(-score)
+    def RangeAUC_volume(self, labels_original, score, windowSize, *, return_curves=True, _score_index=None):
+        score_index = _RangeScoreIndex(score) if _score_index is None else _score_index
 
         tpr_3d = []
         fpr_3d = []
@@ -405,46 +402,32 @@ class metricor:
 
         window_3d = np.arange(0, windowSize + 1, 1)
         P = np.sum(labels_original)
+        ranges = self.range_convers_new(labels_original)
+        started = last_logged = time.perf_counter()
+        logger.info("Computing VUS surface: points=%d thresholds=250 windows=%d (0..%d)",
+                    len(score), len(window_3d), windowSize)
 
-        for window in window_3d:
-            labels = self.extend_postive_range(labels_original, window)
+        for completed, window in enumerate(window_3d, 1):
+            labels = self.extend_postive_range(labels_original, window, ranges=ranges)
 
             # print(np.sum(labels))
             L = self.range_convers_new(labels)
-            TPR_list = [0]
-            FPR_list = [0]
-            Precision_list = [1]
+            tpr, fpr, prec = score_index.curve(labels, P, L)
+            if return_curves:
+                tpr_3d.append(tpr)
+                fpr_3d.append(fpr)
+                prec_3d.append(prec)
 
-            for i in np.linspace(0, len(score) - 1, 250).astype(int):
-                threshold = score_sorted[i]
-                # print('thre='+str(threshold))
-                pred = score >= threshold
-                TPR, FPR, Precision = self.TPR_FPR_RangeAUC(labels, pred, P, L)
-
-                TPR_list.append(TPR)
-                FPR_list.append(FPR)
-                Precision_list.append(Precision)
-
-            TPR_list.append(1)
-            FPR_list.append(1)  # otherwise, range-AUC will stop earlier than (1,1)
-
-            tpr = np.array(TPR_list)
-            fpr = np.array(FPR_list)
-            prec = np.array(Precision_list)
-
-            tpr_3d.append(tpr)
-            fpr_3d.append(fpr)
-            prec_3d.append(prec)
-
-            width = fpr[1:] - fpr[:-1]
-            height = (tpr[1:] + tpr[:-1]) / 2
-            AUC_range = np.sum(width * height)
+            AUC_range, AP_range = _range_areas(tpr, fpr, prec)
             auc_3d.append(AUC_range)
-
-            width_PR = tpr[1:-1] - tpr[:-2]
-            height_PR = (prec[1:] + prec[:-1]) / 2
-            AP_range = np.sum(width_PR * height_PR)
             ap_3d.append(AP_range)
+            now = time.perf_counter()
+            if completed == 1 or completed == len(window_3d) or now - last_logged >= 30:
+                elapsed = now - started
+                eta = elapsed * (len(window_3d) - completed) / completed
+                logger.info("VUS surface windows %d/%d (%.1f%%) elapsed=%.1fs ETA=%.1fs",
+                            completed, len(window_3d), 100 * completed / len(window_3d), elapsed, eta)
+                last_logged = now
 
         return (
             tpr_3d,

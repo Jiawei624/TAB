@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 
+import logging
 import numpy as np
 from sklearn import metrics
-from ts_benchmark.evaluation.metrics.vus_metrics import metricor, generate_curve
+from ts_benchmark.evaluation.metrics.vus_metrics import metricor, _RangeScoreIndex
 from ts_benchmark.evaluation.metrics.utils import get_list_anomaly, find_length
 from sklearn.metrics import precision_recall_curve
 
@@ -11,6 +12,7 @@ __all__ = ["auc_roc", "auc_pr", "R_AUC_ROC", "R_AUC_PR", "VUS_ROC", "VUS_PR"]
 
 
 metricor_grader = metricor()
+logger = logging.getLogger(__name__)
 
 def best_ratio(actual: np.ndarray, predicted: np.ndarray, **kwargs):
     precisions, recalls, thresholds = precision_recall_curve(actual, predicted)
@@ -172,42 +174,50 @@ def auc_pr(actual: np.ndarray, predicted: np.ndarray, **kwargs):
     return metrics.average_precision_score(actual, predicted)
 
 
+def _range_metric_pair(actual, predicted, kwargs, *, volume):
+    """Cache only within one Evaluator call; never reuse another series' scores."""
+    cache = kwargs.get("_metric_cache")
+    if cache is None:
+        cache = {}
+    key = "vus_pair" if volume else "range_auc_pair"
+    if key in cache:
+        logger.info("Reusing shared %s ROC/PR calculation", "VUS" if volume else "range AUC")
+        return cache[key]
+    if "anomaly_window" not in cache:
+        lengths = get_list_anomaly(actual)
+        if not len(lengths):
+            raise ValueError("Range/VUS metrics require at least one anomaly segment")
+        cache["anomaly_window"] = int(np.median(lengths))
+    if "range_score_index" not in cache:
+        cache["range_score_index"] = _RangeScoreIndex(predicted)
+    window, score_index = cache["anomaly_window"], cache["range_score_index"]
+    if volume:
+        # Metric consumers need the two integrals, not all plotting surfaces.
+        result = metricor_grader.RangeAUC_volume(
+            actual, predicted, 2 * window, return_curves=False, _score_index=score_index)
+        pair = result[-2:]
+    else:
+        result = metricor_grader.RangeAUC(
+            actual, predicted, window=window, plot_ROC=True, _score_index=score_index)
+        pair = result[:2]
+    cache[key] = pair
+    return pair
+
+
 def R_AUC_ROC(actual: np.ndarray, predicted: np.ndarray, **kwargs):
-    slidingWindow = int(np.median(get_list_anomaly(actual)))
-    # slidingWindow = 100
-    R_AUC_ROC, R_AUC_PR, _, _, _ = metricor_grader.RangeAUC(
-        labels=actual, score=predicted, window=slidingWindow, plot_ROC=True
-    )
-    return R_AUC_ROC
+    return _range_metric_pair(actual, predicted, kwargs, volume=False)[0]
 
 
 def R_AUC_PR(actual: np.ndarray, predicted: np.ndarray, **kwargs):
-    slidingWindow = int(np.median(get_list_anomaly(actual)))
-    # slidingWindow = 100
-    R_AUC_ROC, R_AUC_PR, _, _, _ = metricor_grader.RangeAUC(
-        labels=actual, score=predicted, window=slidingWindow, plot_ROC=True
-    )
-    return R_AUC_PR
+    return _range_metric_pair(actual, predicted, kwargs, volume=False)[1]
 
 
 def VUS_ROC(actual: np.ndarray, predicted: np.ndarray, **kwargs):
-    slidingWindow = int(np.median(get_list_anomaly(actual)))
-    # slidingWindow = 100
-
-    _, _, _, _, _, _, VUS_ROC, VUS_PR = generate_curve(
-        actual, predicted, 2 * slidingWindow
-    )
-    return VUS_ROC
+    return _range_metric_pair(actual, predicted, kwargs, volume=True)[0]
 
 
 def VUS_PR(actual: np.ndarray, predicted: np.ndarray, **kwargs):
-    slidingWindow = int(np.median(get_list_anomaly(actual)))
-    # slidingWindow = 100
-
-    _, _, _, _, _, _, VUS_ROC, VUS_PR = generate_curve(
-        actual, predicted, 2 * slidingWindow
-    )
-    return VUS_PR
+    return _range_metric_pair(actual, predicted, kwargs, volume=True)[1]
 
 
 # y_test = np.array([1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1])

@@ -104,12 +104,15 @@ class Evaluator:
         """
         evaluate_result = []
         log_info = ""
+        # Shared ROC/PR work belongs to this (actual, predicted) evaluation only.
+        # A fresh cache per call prevents stale results across entities or ratios.
+        metric_kwargs = dict(kwargs, _metric_cache={})
         for metric_name, m in zip(self.metric_names, self.metric_funcs):
             started = time.perf_counter()
             logger.info("Computing evaluation metric %s", metric_name)
             try:
                 evaluate_result.append(
-                    m(actual, predicted, scaler=scaler, hist_data=hist_data, **kwargs)
+                    m(actual, predicted, scaler=scaler, hist_data=hist_data, **metric_kwargs)
                 )
             except Exception as e:
                 evaluate_result.append(np.nan)
