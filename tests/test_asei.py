@@ -4,9 +4,11 @@ import copy
 import importlib
 import tempfile
 from pathlib import Path
+from dataclasses import asdict
 import json
 from types import SimpleNamespace
 import unittest
+import time
 from unittest.mock import patch
 
 import numpy as np
@@ -15,12 +17,13 @@ import torch
 from torch import nn
 
 from ts_benchmark.baselines.self_impl import ASEI
-from ts_benchmark.baselines.self_impl.ASEI.asei import Config
+from ts_benchmark.baselines.self_impl.ASEI.asei import BlockWindowDataset, Config, WindowDataset, collate_blocks
 from ts_benchmark.baselines.self_impl.ASEI.auxiliary import TaskSampler, prepare_objective
 from ts_benchmark.baselines.self_impl.ASEI.calibration import EvidenceReference, empirical_threshold, upper_tail
-from ts_benchmark.baselines.self_impl.ASEI.model import ErrorCorrector, EvidenceScorer, Predictor, cpu_state, lag_graph, project_l1_, unwrap
+from ts_benchmark.baselines.self_impl.ASEI.model import ErrorCorrector, EvidenceScorer, Predictor, cpu_state, lag_graph, project_l1_, temporal_layout, unwrap
 from ts_benchmark.baselines.self_impl.ASEI.optimization import LinearARObjective, fit_projected_ar
 from ts_benchmark.baselines.self_impl.ASEI.protocol import make_protocol, select_protocol
+from ts_benchmark.baselines.self_impl.ASEI.progress import Progress
 from ts_benchmark.models.model_loader import get_models
 
 
@@ -37,6 +40,107 @@ def data(length=1600):
     time = np.arange(length, dtype=np.float64)
     return pd.DataFrame({"a": np.sin(time / 7) + 0.1 * np.cos(time / 3),
                          "b": np.cos(time / 11) + 0.2 * np.sin(time / 7)})
+
+
+class ConfigInterfaceTests(unittest.TestCase):
+    def test_anomaly_transformer_style_parameters_are_effective(self):
+        model = ASEI(batch_size=128, lr=0.0001, num_epochs=10, win_size=100, device="cpu")
+        self.assertEqual(model.config.lr, 0.0001)
+        self.assertEqual(model.config.learning_rate, 0.0001)
+        self.assertEqual(model.config.num_epochs, 10)
+        self.assertEqual(model.config.predictor_epochs, 10)
+        self.assertEqual(model.config.correction_learning_rate, 1e-3)
+        self.assertEqual(model.config.score_learning_rate, 1e-3)
+        self.assertEqual(model.config.score_epochs, 30)
+        self.assertEqual(model.config.checkpoint_epochs, (5, 10, 15, 20, 25, 30))
+        self.assertEqual(model.receptive_field, 100)
+        self.assertEqual(model.history, 115)
+        self.assertEqual(model.raw_history, 126)
+        self.assertEqual(model.temporal_layout_[-1], (2, 37))
+        reconstructed = ASEI(**asdict(model.config))
+        self.assertEqual(reconstructed.config.recovery_suffix, model.config.recovery_suffix)
+        self.assertEqual(reconstructed.config.validation_gap, model.config.validation_gap)
+        protocol = make_protocol(model.config, model.raw_history, 8, 0.125)
+        self.assertEqual(protocol.recovery_suffix, 126 + int(np.ceil(679 * 0.125)))
+        self.assertEqual(protocol.separated_gap, 126 + int(np.ceil(1319 * 0.125)))
+        for kwargs in [dict(lr=0), dict(lr=True), dict(num_epochs=0), dict(win_size=0), dict(win_size=3.5),
+                       dict(lr=1e-4, learning_rate=1e-3), dict(num_epochs=10, predictor_epochs=20)]:
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                ASEI(**kwargs, device="cpu")
+        self.assertEqual(ASEI(lr=1e-4, learning_rate=1e-4).config.learning_rate, 1e-4)
+
+    def test_exact_window_layout_and_causal_sequence_predictions(self):
+        previous_threads = torch.get_num_threads()
+        torch.set_num_threads(2)
+        try:
+            for window in [1, 2, 4, 63, 64, 100, 256]:
+                layout, receptive_field = temporal_layout(3, [1, 2, 4, 8, 16], window)
+                self.assertEqual(receptive_field, window)
+                self.assertEqual(1 + sum((width - 1) * lag for width, lag in layout), window)
+            graph = lag_graph(data(50).values, [1, 2], 1)
+            model = Predictor(2, *graph, hidden=4, embedding=2, win_size=100)
+            values = torch.randn(1, 110, 2)
+            with torch.no_grad():
+                actual = model(values, output_steps=10)
+                expected = torch.cat([model(values[:, index:index + 101]) for index in range(10)], dim=1)
+            torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+        finally:
+            torch.set_num_threads(previous_threads)
+
+    def test_original_tab_configs_compute_and_report_all_metrics(self):
+        from ts_benchmark.evaluation.metrics import CLASSIFICATION_METRICS_LABEL, CLASSIFICATION_METRICS_SCORE
+        root = Path(__file__).resolve().parents[1]
+        for mode, metrics in [("label", CLASSIFICATION_METRICS_LABEL), ("score", CLASSIFICATION_METRICS_SCORE)]:
+            config = json.loads((root / f"config/unfixed_detect_{mode}_multi_config.json").read_text())
+            self.assertEqual(config["evaluation_config"]["metrics"], "all")
+            self.assertEqual(set(config["report_config"]["report_metrics"]), set(metrics))
+
+
+class ExecutionProgressTests(unittest.TestCase):
+    def test_heartbeat_reports_a_waiting_phase_without_fabricating_progress(self):
+        with self.assertLogs("ts_benchmark.baselines.self_impl.ASEI.progress", level="INFO") as logs:
+            with Progress("waiting-test", total=4, interval=0.01) as progress:
+                progress.phase("batch=1 forward")
+                deadline = time.monotonic() + 1
+                while not any("heartbeat" in record.getMessage() for record in logs.records):
+                    if time.monotonic() >= deadline:
+                        self.fail("No progress heartbeat was emitted")
+                    time.sleep(0.01)
+                progress.update(1)
+        heartbeats = [record.getMessage() for record in logs.records if "heartbeat" in record.getMessage()]
+        self.assertTrue(any("progress=0/4" in message and "phase=batch=1 forward" in message for message in heartbeats))
+        self.assertTrue(any("finished" in record.getMessage() for record in logs.records))
+        self.assertFalse(progress._thread.is_alive())
+
+    def test_block_windows_cover_each_target_once_and_match_point_window_gradients(self):
+        previous_threads = torch.get_num_threads()
+        torch.set_num_threads(2)
+        try:
+            values = data(25).values.astype(np.float32)
+            history, block_size = 8, 4
+            point_dataset = WindowDataset(values, history)
+            blocks = BlockWindowDataset(values, history, block_size)
+            histories, targets, mask = collate_blocks([blocks[index] for index in range(len(blocks))])
+            expected_targets = torch.from_numpy(values[history:])
+            torch.testing.assert_close(targets[mask], expected_targets)
+            self.assertEqual(int(mask.sum()), len(point_dataset))
+            point_histories = torch.stack([point_dataset[index][0] for index in range(len(point_dataset))])
+            graph = lag_graph(values, [1, 2], 1)
+            point = Predictor(2, *graph, hidden=4, embedding=2, dilations=[1, 2]).double()
+            blocked = copy.deepcopy(point)
+            expected = point(point_histories.double())[:, 0]
+            actual = blocked(histories.double(), output_steps=targets.shape[1])
+            torch.testing.assert_close(actual[mask], expected, rtol=1e-10, atol=1e-11)
+            loss_point = torch.nn.functional.huber_loss(expected, expected_targets.double()[..., None].expand_as(expected))
+            losses = torch.nn.functional.huber_loss(actual, targets.double()[..., None].expand_as(actual), reduction="none").mean((-1, -2))
+            loss_blocked = (losses * mask).sum() / mask.sum()
+            torch.testing.assert_close(loss_point, loss_blocked, rtol=1e-10, atol=1e-11)
+            loss_point.backward()
+            loss_blocked.backward()
+            for first, second in zip(point.parameters(), blocked.parameters()):
+                torch.testing.assert_close(first.grad, second.grad, rtol=1e-9, atol=1e-10)
+        finally:
+            torch.set_num_threads(previous_threads)
 
 
 class FormulaTests(unittest.TestCase):
@@ -268,6 +372,48 @@ class FitTests(unittest.TestCase):
         self.assertEqual(second.config.lambda_min, 0.8)
         self.assertIsNot(first.scoring_checkpoints_, second.scoring_checkpoints_)
 
+    def test_alias_parameters_train_and_survive_checkpoint_reload(self):
+        model = ASEI(**dict(SMALL, lr=1e-4, num_epochs=1, win_size=6), device="cpu")
+        model.detect_fit(data())
+        self.assertEqual(model.metadata_["predictor_learning_rate"], 1e-4)
+        self.assertEqual(model.metadata_["predictor_max_epochs"], 1)
+        self.assertEqual(unwrap(model.predictor).receptive_field, 6)
+        self.assertEqual(model.raw_history, 10)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "aliases.pt"
+            model.save(path)
+            restored = ASEI.load(path, device="cpu")
+            self.assertEqual(restored.config.learning_rate, 1e-4)
+            self.assertEqual(restored.config.predictor_epochs, 1)
+            self.assertEqual(restored.temporal_layout_, model.temporal_layout_)
+            self.assertEqual(restored.config.recovery_suffix, model.config.recovery_suffix)
+            np.testing.assert_array_equal(restored.detect_score(data(40))[0], model.detect_score(data(40))[0])
+
+    def test_blocked_fit_progress_checkpoint_and_partial_tail(self):
+        model = ASEI(**dict(SMALL, predictor_block_size=16), device="cpu")
+        with self.assertLogs("ts_benchmark.baselines.self_impl.ASEI", level="INFO") as logs:
+            model.detect_fit(data())
+        messages = "\n".join(record.getMessage() for record in logs.records)
+        self.assertIn("predictor epoch=1 train", messages)
+        self.assertIn("predictor epoch=1 validation", messages)
+        self.assertIn("progress=1/", messages)
+        self.assertIn("block_size=16", messages)
+        self.assertIn("stage=3/4 independent_reference", messages)
+        self.assertIn("normal validation calibration", messages)
+        loader = model._predictor_loader(data().iloc[:1024].values)
+        self.assertEqual(sum(int(batch[2].sum()) for batch in loader), 1024 - model.history)
+        self.assertEqual(len(loader), int(np.ceil((1024 - model.history) / 128)))
+        baseline = model._predictor_loss(model._loader(WindowDataset(data(137).values, model.history), 128))
+        blocked = model._predictor_loss(model._predictor_loader(data(137).values))
+        self.assertAlmostEqual(baseline, blocked, places=5)
+        self.assertEqual(len(model.metadata_["stage_seconds"]), 5)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "blocked.pt"
+            model.save(path)
+            restored = ASEI.load(path, device="cpu")
+            self.assertEqual(restored.config.predictor_block_size, 16)
+            np.testing.assert_array_equal(restored.detect_score(data(40))[0], model.detect_score(data(40))[0])
+
     def test_every_timestamp_and_streaming_causality(self):
         model = self.detector
         values = data(83)
@@ -365,7 +511,7 @@ class FitTests(unittest.TestCase):
                 try:
                     for mode, metric_count, rows in [("score", 6, 1), ("label", 16, 1)]:
                         with self.subTest(mode=mode):
-                            config_path = Path(__file__).resolve().parents[1] / f"config/asei_detect_{mode}_multi_config.json"
+                            config_path = Path(__file__).resolve().parents[1] / f"config/unfixed_detect_{mode}_multi_config.json"
                             config = json.loads(config_path.read_text())
                             model_config = {"models": [{"model_name": "self_impl.ASEI", "model_hyper_params":
                                 dict(SMALL, device="cpu", checkpoint_dir=str(root / "checkpoints"))}]}
@@ -439,7 +585,7 @@ class TwoGpuTests(unittest.TestCase):
         for first, second in zip(single.parameters(), parallel.module.parameters()):
             if first.grad is not None:
                 torch.testing.assert_close(first.grad, second.grad, rtol=1e-3, atol=1e-4)
-        detector = ASEI(**SMALL, multi_gpu=True)
+        detector = ASEI(**dict(SMALL, predictor_block_size=16), multi_gpu=True)
         detector.detect_fit(data())
         self.assertIsInstance(detector.predictor, nn.DataParallel)
         self.assertIsInstance(detector.corrector, nn.DataParallel)

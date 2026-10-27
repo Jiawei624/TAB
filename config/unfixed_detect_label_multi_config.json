@@ -30,7 +30,12 @@
 
     "report_config" : {
         "aggregate_type": "mean",
-        "report_metrics": ["affiliation_f", "add"],
+        "report_metrics": [
+            "accuracy", "f_score", "precision", "recall",
+            "adjust_accuracy", "adjust_f_score", "adjust_precision", "adjust_recall",
+            "rrecall", "rprecision", "precision_at_k", "rf",
+            "affiliation_f", "affiliation_precision", "affiliation_recall", "add"
+        ],
         "fill_type": "mean_value",
         "null_value_threshold": "0.3"
     }

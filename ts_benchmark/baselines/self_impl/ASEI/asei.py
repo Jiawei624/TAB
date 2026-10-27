@@ -1,12 +1,15 @@
 """TAB adapter and four-stage training for Adaptive Spatiotemporal Evidence Integration."""
 
 import copy
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 import hashlib
 import json
 import logging
 from pathlib import Path
 import platform
+import math
+import time
 
 import numpy as np
 import pandas as pd
@@ -19,9 +22,10 @@ from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 from .auxiliary import TaskSampler, characteristic_scale, objective, prepare_objective
 from .calibration import EvidenceReference, empirical_threshold, error_history, local_features
-from .model import ErrorCorrector, EvidenceScorer, Predictor, cpu_state, lag_graph, unwrap
+from .model import ErrorCorrector, EvidenceScorer, Predictor, cpu_state, lag_graph, temporal_layout, unwrap
 from .optimization import LinearARObjective, fit_projected_ar
 from .protocol import AuxiliaryProtocol, select_protocol
+from .progress import IMPLEMENTATION_VERSION, Progress
 
 
 logger = logging.getLogger(__name__)
@@ -29,6 +33,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Config:
+    lr: object = None  # AnomalyTransformer-style alias for predictor learning_rate.
+    num_epochs: object = None  # Alias for predictor_epochs; other stages keep their budgets.
+    win_size: object = None  # Exact self-history receptive field; None keeps the base TCN.
     hidden_dim: int = 32
     embedding_dim: int = 8
     kernel_size: int = 3
@@ -50,6 +57,8 @@ class Config:
     predictor_epochs: int = 50
     patience: int = 5
     batch_size: int = 128
+    predictor_block_size: int = 1  # Contiguous targets per window; 1 preserves point-window sampling.
+    log_interval_seconds: float = 30
     learning_rate: float = 1e-3
     ar_max_iter: int = 1000
     ar_initial_step: float = 0.01
@@ -95,6 +104,37 @@ class WindowDataset(Dataset):
         return self.values[index:index + self.history], self.values[index + self.history]
 
 
+class BlockWindowDataset(Dataset):
+    """Partition every valid target into contiguous blocks, with causal left context."""
+    def __init__(self, values, history, block_size):
+        self.values = torch.as_tensor(np.asarray(values, dtype=np.float32))
+        self.history, self.block_size = history, block_size
+        self.target_count = len(self.values) - history
+        if self.target_count < 1:
+            raise ValueError("Block predictor training requires at least one valid target")
+
+    def __len__(self):
+        return math.ceil(self.target_count / self.block_size)
+
+    def __getitem__(self, index):
+        start = index * self.block_size
+        steps = min(self.block_size, self.target_count - start)
+        return (self.values[start:start + self.history + steps - 1],
+                self.values[start + self.history:start + self.history + steps])
+
+
+def collate_blocks(batch):
+    steps = max(len(target) for _, target in batch)
+    histories, targets, masks = [], [], []
+    for history, target in batch:
+        missing = steps - len(target)
+        # Only unused tensor positions are padded; every real target remains in the loss.
+        histories.append(F.pad(history, (0, 0, 0, missing)))
+        targets.append(F.pad(target, (0, 0, 0, missing)))
+        masks.append(torch.arange(steps) < len(target))
+    return torch.stack(histories), torch.stack(targets), torch.stack(masks)
+
+
 class ASEI:
     model_name = "ASEI"
 
@@ -102,12 +142,24 @@ class ASEI:
         unknown = set(kwargs) - set(Config.__dataclass_fields__)
         if unknown:
             raise ValueError(f"Unknown ASEI hyperparameters: {sorted(unknown)}")
-        self.config = Config(**kwargs)
+        options = dict(kwargs)
+        for alias, target in [("lr", "learning_rate"), ("num_epochs", "predictor_epochs")]:
+            if options.get(alias) is not None:
+                if target in options and options[target] != options[alias]:
+                    raise ValueError(f"Conflicting ASEI hyperparameters: {alias} and {target}")
+                options[target] = options[alias]
+        self.config = Config(**options)
         self._validate_config()
         cfg = self.config
-        self.receptive_field = 1 + (cfg.kernel_size - 1) * sum(cfg.dilations)
+        self.temporal_layout_, self.receptive_field = temporal_layout(cfg.kernel_size, cfg.dilations, cfg.win_size)
+        self.win_size = self.receptive_field
         self.history = self.receptive_field + max(cfg.graph_lags) - 1
         self.raw_history = self.history + cfg.ar_order + cfg.rolling_window - 1
+        base_field = temporal_layout(cfg.kernel_size, cfg.dilations)[1]
+        for name in ["recovery_suffix", "validation_gap"]:
+            if name not in kwargs:
+                # Preserve complete recovery/separation update budgets when W changes.
+                setattr(cfg, name, getattr(cfg, name) + self.receptive_field - base_field)
         self.seed = int(torch.initial_seed() % (2 ** 32) if cfg.seed is None else cfg.seed)
         device = ("cuda:0" if torch.cuda.is_available() else "cpu") if cfg.device == "auto" else cfg.device
         self.device = torch.device(device)
@@ -120,13 +172,18 @@ class ASEI:
             for name in ["batch_size", "correction_batch_size", "auxiliary_batch_size"]:
                 if getattr(cfg, name) < len(self.device_ids):
                     raise ValueError(f"{name} must be at least the number of training GPUs")
+            if cfg.batch_size // cfg.predictor_block_size < len(self.device_ids):
+                raise ValueError("batch_size / predictor_block_size must be at least the number of training GPUs")
         self.scaler = StandardScaler()
         self._fitted = False
 
     def _validate_config(self):
         cfg = self.config
+        if cfg.win_size is not None and (isinstance(cfg.win_size, bool)
+                or not isinstance(cfg.win_size, int) or cfg.win_size < 1):
+            raise ValueError("win_size must be a positive integer")
         positive_integers = ["hidden_dim", "embedding_dim", "kernel_size", "graph_neighbors", "ar_order",
-                             "rolling_window", "predictor_epochs", "patience", "batch_size", "ar_max_iter",
+                             "rolling_window", "predictor_epochs", "patience", "batch_size", "predictor_block_size", "ar_max_iter",
                              "correction_epochs", "correction_batch_size", "score_epochs", "auxiliary_per_epoch",
                              "auxiliary_batch_size", "normal_prefix", "recovery_suffix", "validation_gap",
                              "hard_pool_size", "rank_pairs", "inference_chunk_size"]
@@ -140,10 +197,12 @@ class ASEI:
                     isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in values):
                 raise ValueError(f"{name} must contain positive integers")
         for name in ["learning_rate", "ar_initial_step", "ar_tolerance", "correction_learning_rate", "score_learning_rate",
-                     "evidence_bound", "classification_temperature", "ranking_temperature", "ranking_margin"]:
+                     "evidence_bound", "classification_temperature", "ranking_temperature", "ranking_margin", "log_interval_seconds"]:
             value = getattr(cfg, name)
-            if not np.isfinite(value) or value <= 0:
+            if isinstance(value, bool) or not np.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
+        if cfg.batch_size % cfg.predictor_block_size:
+            raise ValueError("batch_size must be divisible by predictor_block_size")
         if not 0 < cfg.rho < 1 or not 0 < cfg.omega_min < 0.5:
             raise ValueError("Require 0 < rho < 1 and 0 < omega_min < 0.5")
         if not 0 < cfg.ar_backtracking_factor < 1:
@@ -220,24 +279,64 @@ class ASEI:
         generator = torch.Generator().manual_seed(self.seed)
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, drop_last=False,
                           num_workers=self.config.num_workers, pin_memory=self.device.type == "cuda",
-                          generator=generator)
+                          generator=generator, persistent_workers=self.config.num_workers > 0,
+                          multiprocessing_context="spawn" if self.config.num_workers > 0 else None)
 
-    def _predictor_loss(self, loader, optimizer=None):
+    def _stage(self, name, work):
+        started = time.monotonic()
+        with Progress(f"stage={name}", interval=self.config.log_interval_seconds) as progress:
+            progress.phase("executing")
+            result = work()
+        self.metadata_.setdefault("stage_seconds", {})[name] = time.monotonic() - started
+        return result
+
+    def _predictor_loader(self, values, shuffle=False):
+        cfg = self.config
+        if cfg.predictor_block_size == 1:
+            return self._loader(WindowDataset(values, self.history), cfg.batch_size, shuffle)
+        return DataLoader(
+            BlockWindowDataset(values, self.history, cfg.predictor_block_size),
+            batch_size=cfg.batch_size // cfg.predictor_block_size, shuffle=shuffle,
+            drop_last=False, collate_fn=collate_blocks, num_workers=cfg.num_workers,
+            pin_memory=self.device.type == "cuda", generator=torch.Generator().manual_seed(self.seed),
+            persistent_workers=cfg.num_workers > 0,
+            multiprocessing_context="spawn" if cfg.num_workers > 0 else None,
+        )
+
+    def _predictor_loss(self, loader, optimizer=None, epoch=None):
         total, count = 0.0, 0
         self.predictor.train(optimizer is not None)
-        with torch.set_grad_enabled(optimizer is not None):
-            for history, target in loader:
+        label = f"predictor epoch={epoch} {'train' if optimizer is not None else 'validation'}"
+        with torch.set_grad_enabled(optimizer is not None), Progress(label, len(loader), self.config.log_interval_seconds) as progress:
+            progress.phase("data_loading")
+            for step, batch in enumerate(loader, 1):
+                history, target = batch[:2]
+                valid = batch[2] if len(batch) == 3 else None
+                points = int(valid.sum().item()) if valid is not None else len(history)
+                progress.phase(f"batch={step} transfer")
                 history, target = history.to(self.device), target.to(self.device)
+                if target.ndim == 2:
+                    target = target[:, None]
                 if optimizer is not None:
                     optimizer.zero_grad(set_to_none=True)
-                predicted = self.predictor(history)
-                loss = F.huber_loss(predicted, target[:, None, :, None].expand_as(predicted), delta=1)
+                progress.phase(f"batch={step} forward")
+                predicted = self.predictor(history, output_steps=target.shape[1])
+                actual = target[..., None].expand_as(predicted)
+                if valid is None:
+                    loss = F.huber_loss(predicted, actual, delta=1)
+                else:
+                    losses = F.huber_loss(predicted, actual, delta=1, reduction="none").mean(dim=(-1, -2))
+                    loss = (losses * valid.to(self.device)).sum() / points
                 self._finite(loss, "predictor loss")
                 if optimizer is not None:
+                    progress.phase(f"batch={step} backward")
                     loss.backward()
+                    progress.phase(f"batch={step} optimizer")
                     optimizer.step()
-                total += loss.item() * len(history)
-                count += len(history)
+                total += loss.item() * points
+                count += points
+                progress.update(step, f"mean_loss={total / count:.7f} target_points={count}")
+                progress.phase("data_loading")
         return total / count
 
     @staticmethod
@@ -247,18 +346,26 @@ class ASEI:
 
     def _fit_predictor(self, fit, validation):
         cfg = self.config
-        sources, delays, mask = lag_graph(fit, cfg.graph_lags, cfg.graph_neighbors)
-        self.predictor = self._wrap(Predictor(len(self.columns_), sources, delays, mask,
-                                              cfg.hidden_dim, cfg.embedding_dim,
-                                              cfg.kernel_size, cfg.dilations))
-        train_loader = self._loader(WindowDataset(fit, self.history), cfg.batch_size, True)
-        val_loader = self._loader(WindowDataset(validation, self.history), cfg.batch_size)
-        optimizer = torch.optim.AdamW(self.predictor.parameters(), lr=cfg.learning_rate,
-                                      weight_decay=cfg.weight_decay)
+        with Progress("lag_graph", interval=cfg.log_interval_seconds) as progress:
+            progress.phase("aligned_correlations")
+            sources, delays, mask = lag_graph(fit, cfg.graph_lags, cfg.graph_neighbors)
+        with Progress("predictor setup", interval=cfg.log_interval_seconds) as progress:
+            progress.phase("model_device_initialization")
+            self.predictor = self._wrap(Predictor(len(self.columns_), sources, delays, mask,
+                                                  cfg.hidden_dim, cfg.embedding_dim,
+                                                  cfg.kernel_size, cfg.dilations, win_size=cfg.win_size))
+            progress.phase("data_loaders")
+            train_loader = self._predictor_loader(fit, True)
+            val_loader = self._predictor_loader(validation)
+            optimizer = torch.optim.AdamW(self.predictor.parameters(), lr=cfg.learning_rate,
+                                          weight_decay=cfg.weight_decay)
+        logger.info("ASEI predictor workload train_targets=%d train_batches=%d validation_targets=%d validation_batches=%d block_size=%d",
+                    len(fit) - self.history, len(train_loader), len(validation) - self.history,
+                    len(val_loader), cfg.predictor_block_size)
         best_loss, checkpoint, stale, best_epoch = float("inf"), None, 0, 0
         for epoch in range(1, cfg.predictor_epochs + 1):
-            train_loss = self._predictor_loss(train_loader, optimizer)
-            val_loss = self._predictor_loss(val_loader)
+            train_loss = self._predictor_loss(train_loader, optimizer, epoch)
+            val_loss = self._predictor_loss(val_loader, epoch=epoch)
             logger.info("ASEI predictor epoch=%d train=%.6f validation=%.6f", epoch, train_loss, val_loss)
             if val_loss < best_loss:
                 best_loss, checkpoint, stale, best_epoch = val_loss, cpu_state(self.predictor), 0, epoch
@@ -272,25 +379,32 @@ class ASEI:
                                        "graph_edges": int(mask.sum())}
 
     @torch.no_grad()
-    def _errors(self, values):
+    def _errors(self, values, progress_label=None):
         # Frozen sequence inference reuses causal convolution states within each chunk.
         # The primary GPU processes continuous time; temporal state is never split across replicas.
         predictor = unwrap(self.predictor)
         result = []
-        for begin in range(self.history, len(values), self.config.inference_chunk_size):
-            end = min(len(values), begin + self.config.inference_chunk_size)
-            inputs = torch.as_tensor(values[begin - self.history:end - 1],
-                                     dtype=torch.float32, device=self.device)[None]
-            predicted = predictor(inputs, output_steps=end - begin)[0]
-            actual = torch.as_tensor(values[begin:end], dtype=torch.float32, device=self.device)
-            error = (actual[..., None] - predicted).square()
-            self._finite(error, "prediction errors")
-            result.append(error.cpu().numpy())
+        chunks = math.ceil(max(0, len(values) - self.history) / self.config.inference_chunk_size)
+        context = Progress(progress_label, chunks, self.config.log_interval_seconds) if progress_label else nullcontext()
+        with context as progress:
+            for step, begin in enumerate(range(self.history, len(values), self.config.inference_chunk_size), 1):
+                if progress:
+                    progress.phase(f"chunk={step} prediction")
+                end = min(len(values), begin + self.config.inference_chunk_size)
+                inputs = torch.as_tensor(values[begin - self.history:end - 1],
+                                         dtype=torch.float32, device=self.device)[None]
+                predicted = predictor(inputs, output_steps=end - begin)[0]
+                actual = torch.as_tensor(values[begin:end], dtype=torch.float32, device=self.device)
+                error = (actual[..., None] - predicted).square()
+                self._finite(error, "prediction errors")
+                result.append(error.cpu().numpy())
+                if progress:
+                    progress.update(step)
         return np.concatenate(result) if result else np.empty((0, len(self.columns_), 2), dtype=np.float32)
 
     def _fit_corrector(self, values):
         cfg = self.config
-        errors = self._errors(values)
+        errors = self._errors(values, "correction prediction errors")
         history = error_history(errors, cfg.ar_order)
         target = errors[cfg.ar_order:]
         corrector = ErrorCorrector(len(self.columns_), cfg.ar_order, cfg.rho)
@@ -307,13 +421,14 @@ class ASEI:
         # Full-batch float64 sufficient sums are reduced across DataParallel replicas.
         # No optimizer update is made until every fitting sample has contributed.
         linear_objective = self._wrap(LinearARObjective(corrector))
-        ar_status = fit_projected_ar(
-            linear_objective,
-            torch.as_tensor(history, dtype=torch.float64, device=self.device),
-            torch.as_tensor(target, dtype=torch.float64, device=self.device),
-            radius=cfg.rho, max_iter=cfg.ar_max_iter, initial_step=cfg.ar_initial_step,
-            shrink=cfg.ar_backtracking_factor, tolerance=cfg.ar_tolerance,
-        )
+        with Progress("linear_AR", cfg.ar_max_iter, cfg.log_interval_seconds) as progress:
+            ar_status = fit_projected_ar(
+                linear_objective,
+                torch.as_tensor(history, dtype=torch.float64, device=self.device),
+                torch.as_tensor(target, dtype=torch.float64, device=self.device),
+                radius=cfg.rho, max_iter=cfg.ar_max_iter, initial_step=cfg.ar_initial_step,
+                shrink=cfg.ar_backtracking_factor, tolerance=cfg.ar_tolerance, progress=progress,
+            )
         corrector.bias.requires_grad_(False)
         corrector.beta.requires_grad_(False)
         corrector.mlp.requires_grad_(True)
@@ -325,15 +440,18 @@ class ASEI:
         for epoch in range(1, cfg.correction_epochs + 1):
             total, count = 0.0, 0
             self.corrector.train()
-            for previous, current in loader:
-                previous, current = previous.to(self.device), current.to(self.device, dtype=torch.float64)
-                optimizer.zero_grad(set_to_none=True)
-                loss = F.huber_loss(self.corrector(previous), current, delta=1)
-                self._finite(loss, "correction loss")
-                loss.backward()
-                optimizer.step()
-                total += loss.item() * len(previous)
-                count += len(previous)
+            with Progress(f"compensation epoch={epoch}", len(loader), cfg.log_interval_seconds) as progress:
+                for step, (previous, current) in enumerate(loader, 1):
+                    progress.phase(f"batch={step} forward_backward")
+                    previous, current = previous.to(self.device), current.to(self.device, dtype=torch.float64)
+                    optimizer.zero_grad(set_to_none=True)
+                    loss = F.huber_loss(self.corrector(previous), current, delta=1)
+                    self._finite(loss, "correction loss")
+                    loss.backward()
+                    optimizer.step()
+                    total += loss.item() * len(previous)
+                    count += len(previous)
+                    progress.update(step, f"mean_loss={total / count:.7f}")
             if epoch == cfg.correction_epochs or epoch == 1 or epoch % 10 == 0:
                 logger.info("ASEI compensation MLP epoch=%d loss=%.6f", epoch, total / count)
         self._freeze(self.corrector)
@@ -374,6 +492,32 @@ class ASEI:
         return EvidenceScorer(cfg.evidence_bound, cfg.omega_min, protocol.lambda_min,
                               protocol.lambda_max, protocol.lambda_init, kappa, cfg.classification_temperature)
 
+    def _fit_reference(self, reference):
+        errors = self._errors(reference, "independent reference prediction errors")
+        residuals = self._residuals(errors)
+        self.reference = EvidenceReference(self.config.evidence_bound).fit(errors[self.config.ar_order:], residuals)
+
+    @torch.no_grad()
+    def _calibrate(self, validation):
+        state, score_chunks = None, []
+        chunks = math.ceil((len(validation) - self.raw_history) / self.config.inference_chunk_size)
+        with Progress("normal validation calibration", chunks, self.config.log_interval_seconds) as progress:
+            for step, features in enumerate(self._feature_chunks(validation), 1):
+                progress.phase(f"chunk={step} state_updates")
+                current, state = self.scorer.integrate(torch.as_tensor(features, device=self.device)[None], state)
+                score_chunks.append(current[0].cpu().numpy())
+                progress.update(step)
+        self.validation_scores_ = np.concatenate(score_chunks)
+        self.thresholds_, calibration = {}, []
+        for alpha in self.alphas:
+            threshold, false_alarms = empirical_threshold(self.validation_scores_, alpha)
+            self.thresholds_[alpha] = threshold
+            count = len(self.validation_scores_)
+            calibration.append(dict(alpha=alpha, N=count, K=int(np.floor(alpha * count)),
+                                    threshold=threshold, false_alarm_count=false_alarms,
+                                    empirical_fpr=false_alarms / count, normal_points=count, resolution=1 / count))
+        self.metadata_["calibration"] = calibration
+
     def _batch(self, tasks, sampler):
         arrays, metadata = [], []
         for task in tasks:
@@ -395,17 +539,19 @@ class ASEI:
     @torch.no_grad()
     def _validate_scorers(self, candidates, sampler, tasks):
         grouped = [{} for _ in candidates]
-        for task_index, task in enumerate(tasks):
-            features, metadata = self._batch([task], sampler)
-            for candidate_index, candidate in enumerate(candidates):
-                candidate["model"].eval()
-                detection, ranking = self._loss(candidate["model"], features, metadata)
-                loss = (detection + ranking).item()
-                if not np.isfinite(loss):
-                    raise FloatingPointError("ASEI validation auxiliary objective is not finite")
-                grouped[candidate_index].setdefault((task.family, task.scenario), []).append(loss)
-            if (task_index + 1) % 12 == 0:
-                logger.info("ASEI scoring validation tasks=%d/%d", task_index + 1, len(tasks))
+        with Progress("scoring validation", len(tasks), self.config.log_interval_seconds) as progress:
+            for task_index, task in enumerate(tasks):
+                progress.phase(f"task={task_index + 1} evidence")
+                features, metadata = self._batch([task], sampler)
+                for candidate_index, candidate in enumerate(candidates):
+                    progress.phase(f"task={task_index + 1} candidate={candidate_index + 1}/{len(candidates)}")
+                    candidate["model"].eval()
+                    detection, ranking = self._loss(candidate["model"], features, metadata)
+                    loss = (detection + ranking).item()
+                    if not np.isfinite(loss):
+                        raise FloatingPointError("ASEI validation auxiliary objective is not finite")
+                    grouped[candidate_index].setdefault((task.family, task.scenario), []).append(loss)
+                progress.update(task_index + 1)
         self._last_validation_groups_ = [
             {f"family{family}/{scenario}": dict(loss=float(np.mean(values)), count=len(values))
              for (family, scenario), values in groups.items()}
@@ -427,9 +573,13 @@ class ASEI:
                                        optimizer=torch.optim.AdamW(model.parameters(), lr=cfg.score_learning_rate,
                                                                     weight_decay=cfg.weight_decay)))
         state_means = []
-        for features in self._feature_chunks(fit):
-            state_g = features[..., 1].astype(np.float64) + self.reference.center[None, :, 1]
-            state_means.append(state_g.mean(1))
+        chunks = math.ceil((len(fit) - self.raw_history) / cfg.inference_chunk_size)
+        with Progress("hard-normal evidence", chunks, cfg.log_interval_seconds) as progress:
+            for step, features in enumerate(self._feature_chunks(fit), 1):
+                progress.phase(f"chunk={step} evidence")
+                state_g = features[..., 1].astype(np.float64) + self.reference.center[None, :, 1]
+                state_means.append(state_g.mean(1))
+                progress.update(step)
         hardness = np.r_[np.zeros(self.raw_history), np.concatenate(state_means)]
         hardness_sum = np.r_[0.0, hardness.cumsum()]
         del state_means
@@ -451,19 +601,24 @@ class ASEI:
                     pool.sort(key=difficulty, reverse=True)
                     task = pool[int(rng.integers(max(1, int(np.ceil(len(pool) / 4)))))]
                 tasks.append(task)
-            for begin in range(0, len(tasks), cfg.auxiliary_batch_size):
-                features, metadata = self._batch(tasks[begin:begin + cfg.auxiliary_batch_size], sampler)
-                for candidate in candidates:
-                    model, optimizer = candidate["model"], candidate["optimizer"]
-                    model.train()
-                    optimizer.zero_grad(set_to_none=True)
-                    detection, ranking = self._loss(model, features, metadata)
-                    loss = detection + candidate["gamma"] * ranking
-                    self._finite(loss, "scoring objective")
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), 1)
-                    optimizer.step()
-                    unwrap(model).project_()
+            batches = math.ceil(len(tasks) / cfg.auxiliary_batch_size)
+            with Progress(f"scoring epoch={epoch}", batches, cfg.log_interval_seconds) as progress:
+                for step, begin in enumerate(range(0, len(tasks), cfg.auxiliary_batch_size), 1):
+                    progress.phase(f"batch={step} evidence")
+                    features, metadata = self._batch(tasks[begin:begin + cfg.auxiliary_batch_size], sampler)
+                    for candidate_index, candidate in enumerate(candidates):
+                        progress.phase(f"batch={step} candidate={candidate_index + 1}/{len(candidates)} forward_backward")
+                        model, optimizer = candidate["model"], candidate["optimizer"]
+                        model.train()
+                        optimizer.zero_grad(set_to_none=True)
+                        detection, ranking = self._loss(model, features, metadata)
+                        loss = detection + candidate["gamma"] * ranking
+                        self._finite(loss, "scoring objective")
+                        loss.backward()
+                        nn.utils.clip_grad_norm_(model.parameters(), 1)
+                        optimizer.step()
+                        unwrap(model).project_()
+                    progress.update(step)
             logger.info("ASEI scoring epoch=%d/%d candidates=%d", epoch, cfg.score_epochs, len(candidates))
             if epoch in cfg.checkpoint_epochs:
                 losses = self._validate_scorers(candidates, valid_sampler, valid_tasks)
@@ -531,11 +686,14 @@ class ASEI:
             for begin in range(0, len(digest_values), 4096):
                 signature.update(memoryview(np.ascontiguousarray(digest_values[begin:begin + 4096])).cast("B"))
         self.metadata_ = dict(
+            implementation_version=IMPLEMENTATION_VERSION,
             data_sha256=signature.hexdigest(),
             seed=self.seed, splits={"outer_training_end": boundary, "predictor_end": first,
                                    "corrector_end": second, "training_end": len(training),
                                    "validation_points": len(validation), "external_validation": valid_data is not None},
             receptive_field=self.receptive_field, raw_history=self.raw_history, T0=scale,
+            temporal_layout=[list(block) for block in self.temporal_layout_],
+            predictor_learning_rate=cfg.learning_rate, predictor_max_epochs=cfg.predictor_epochs,
             auxiliary_protocol=asdict(self.protocol_), protocol_feasibility=protocol_trials,
             reference_points=len(reference) - self.history - cfg.ar_order,
             validation_task_count=len(validation_tasks), device=str(self.device),
@@ -546,34 +704,23 @@ class ASEI:
         logger.info("ASEI device=%s logical_gpu_ids=%s W=%d raw_history=%d splits=%s T0=%d s=%g",
                     self.device, self.device_ids, self.receptive_field, self.raw_history,
                     self.metadata_["splits"], scale, self.protocol_.s)
-        self._fit_predictor(fit, validation)
-        self._fit_corrector(correction)
-        errors = self._errors(reference)
-        residuals = self._residuals(errors)
-        # d and r use the same valid timestamps, all within the independent reference segment.
-        self.reference = EvidenceReference(cfg.evidence_bound).fit(errors[cfg.ar_order:], residuals)
-        self._fit_scorer(fit, validation, scale)
-        with torch.no_grad():
-            state, score_chunks = None, []
-            for features in self._feature_chunks(validation):
-                current, state = self.scorer.integrate(torch.as_tensor(features, device=self.device)[None], state)
-                score_chunks.append(current[0].cpu().numpy())
-            self.validation_scores_ = np.concatenate(score_chunks)
-        self.thresholds_, calibration = {}, []
-        for alpha in self.alphas:
-            threshold, false_alarms = empirical_threshold(self.validation_scores_, alpha)
-            self.thresholds_[alpha] = threshold
-            count = len(self.validation_scores_)
-            calibration.append(dict(alpha=alpha, N=count, K=int(np.floor(alpha * count)),
-                                    threshold=threshold, false_alarm_count=false_alarms,
-                                    empirical_fpr=false_alarms / count, normal_points=count, resolution=1 / count))
-        self.metadata_["calibration"] = calibration
+        logger.info("ASEI predictor batch_size=%d lr=%g max_epochs=%d; compensation_epochs=%d scoring_epochs=%d",
+                    cfg.batch_size, cfg.learning_rate, cfg.predictor_epochs,
+                    cfg.correction_epochs, cfg.score_epochs)
+        logger.info("ASEI runtime implementation=%s source=%s channels=%d predictor_block_size=%d",
+                    IMPLEMENTATION_VERSION, __file__, len(self.columns_), cfg.predictor_block_size)
+        self._stage("1/4 predictor", lambda: self._fit_predictor(fit, validation))
+        self._stage("2/4 correction", lambda: self._fit_corrector(correction))
+        # d and r use the same timestamps within the independent reference segment.
+        self._stage("3/4 independent_reference", lambda: self._fit_reference(reference))
+        self._stage("4/4 scoring", lambda: self._fit_scorer(fit, validation, scale))
+        self._stage("threshold_calibration", lambda: self._calibrate(validation))
         self.metadata_["parameters"] = {
             name: sum(parameter.numel() for parameter in unwrap(module).parameters())
             for name, module in [("predictor", self.predictor), ("corrector", self.corrector), ("scorer", self.scorer)]}
         self._fitted = True
         self.reset_state()
-        logger.info("ASEI selected=%s calibration=%s", self.metadata_["selection"], calibration)
+        logger.info("ASEI selected=%s calibration=%s", self.metadata_["selection"], self.metadata_["calibration"])
         if cfg.checkpoint_dir:
             config_hash = hashlib.sha256(json.dumps(asdict(cfg), sort_keys=True).encode("utf-8")).hexdigest()[:8]
             path = Path(cfg.checkpoint_dir) / f"asei_seed{self.seed}_{signature.hexdigest()[:16]}_{config_hash}.pt"
@@ -653,7 +800,8 @@ class ASEI:
         cfg, state = detector.config, payload["predictor"]
         detector.predictor = detector._wrap(Predictor(len(detector.columns_), state["sources"],
                                                        state["delays"], state["edge_mask"], cfg.hidden_dim,
-                                                       cfg.embedding_dim, cfg.kernel_size, cfg.dilations))
+                                                       cfg.embedding_dim, cfg.kernel_size, cfg.dilations,
+                                                       win_size=cfg.win_size))
         unwrap(detector.predictor).load_state_dict(state)
         detector.corrector = detector._wrap(ErrorCorrector(len(detector.columns_), cfg.ar_order, cfg.rho))
         unwrap(detector.corrector).load_state_dict(payload["corrector"])

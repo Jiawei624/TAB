@@ -30,7 +30,7 @@ class LinearARObjective(nn.Module):
 
 @torch.no_grad()
 def fit_projected_ar(objective, history, target, radius=0.95, max_iter=1000,
-                     initial_step=0.01, shrink=0.5, tolerance=1e-5):
+                     initial_step=0.01, shrink=0.5, tolerance=1e-5, progress=None):
     """Optimize the global mean Huber_1 loss; never make mini-batch updates."""
     module = unwrap(objective)
     if any(value.dtype != torch.float64 for value in (history, target, module.bias, module.beta)):
@@ -54,6 +54,8 @@ def fit_projected_ar(objective, history, target, radius=0.95, max_iter=1000,
     step = initial_step
     initial_loss = None
     for iteration in range(1, max_iter + 1):
+        if progress is not None:
+            progress.phase(f"iteration={iteration} full_gradient")
         loss, grad_bias, grad_beta = statistics()
         if not all(torch.isfinite(value).all().item() for value in (loss, grad_bias, grad_beta)):
             raise FloatingPointError("ASEI full-batch AR loss/gradient is not finite")
@@ -65,6 +67,8 @@ def fit_projected_ar(objective, history, target, radius=0.95, max_iter=1000,
             step *= 2
         reductions = 0
         while True:
+            if progress is not None:
+                progress.phase(f"iteration={iteration} backtracking={reductions}")
             candidate_bias, candidate_beta = proposal(bias, beta, grad_bias, grad_beta, step)
             diff_bias, diff_beta = candidate_bias - bias, candidate_beta - beta
             rhs = (loss + (grad_bias * diff_bias).sum() + (grad_beta * diff_beta).sum()
@@ -88,6 +92,8 @@ def fit_projected_ar(objective, history, target, radius=0.95, max_iter=1000,
         trace.append(dict(iteration=iteration, loss=loss_value, candidate_loss=candidate_value,
                           quadratic_upper_bound=upper_bound, numerical_slack=slack,
                           step=step, backtracking_reductions=reductions, gradient_mapping_inf=mapping))
+        if progress is not None:
+            progress.update(iteration, f"loss={candidate_value:.8g} mapping_inf={mapping:.5g} step={step:.5g}")
         if mapping <= tolerance:
             # This mapping was measured at (bias, beta); return that verified point.
             module.bias.copy_(bias)

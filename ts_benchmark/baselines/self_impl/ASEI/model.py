@@ -78,15 +78,34 @@ class CausalBlock(nn.Module):
         return F.gelu(self.norm(values.transpose(1, 2))).transpose(1, 2)
 
 
+def temporal_layout(kernel, dilations, window=None):
+    """Keep the base TCN by default; build an exact causal receptive field on request."""
+    layout, receptive_field = [], 1
+    for dilation in dilations:
+        increase = (kernel - 1) * dilation
+        if window is not None and receptive_field + increase > window:
+            break
+        layout.append((kernel, dilation))
+        receptive_field += increase
+    if window is not None:
+        while receptive_field < window:
+            # A two-tap convolution expands the field without introducing gaps.
+            increase = min(receptive_field, window - receptive_field)
+            layout.append((2, increase))
+            receptive_field += increase
+    return tuple(layout), receptive_field
+
+
 class Predictor(nn.Module):
     def __init__(self, channels, sources, delays, mask, hidden=32,
-                 embedding=8, kernel=3, dilations=(1, 2, 4, 8, 16)):
+                 embedding=8, kernel=3, dilations=(1, 2, 4, 8, 16), win_size=None):
         super().__init__()
         self.channels = channels
         self.embedding = nn.Embedding(channels, embedding)
         self.input_projection = nn.Linear(1 + embedding, hidden)
-        self.encoder = nn.Sequential(*(CausalBlock(hidden, kernel, dilation)
-                                       for dilation in dilations))
+        self.temporal_layout, self.receptive_field = temporal_layout(kernel, dilations, win_size)
+        self.encoder = nn.Sequential(*(CausalBlock(hidden, width, dilation)
+                                       for width, dilation in self.temporal_layout))
         self.graph_projection = nn.Linear(hidden, hidden, bias=False)
         self.self_head = nn.Sequential(nn.Linear(hidden + embedding, hidden),
                                        nn.GELU(), nn.Linear(hidden, 1))

@@ -30,7 +30,7 @@
 
     "report_config" : {
         "aggregate_type": "mean",
-        "report_metrics": ["auc_roc"],
+        "report_metrics": ["auc_roc", "auc_pr", "R_AUC_ROC", "R_AUC_PR", "VUS_ROC", "VUS_PR"],
         "fill_type": "mean_value",
         "null_value_threshold": "0.3"
     }

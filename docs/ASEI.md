@@ -9,7 +9,7 @@ ASEI 实现依据工作区的 `In1_1_3.md`。入口为 `self_impl.ASEI`，直接
 ```bash
 python -m pip install -r requirements-asei.txt
 
-# 默认物理 GPU1 为主卡，GPU0 为副卡；省略数据参数则评测元数据中的全部多变量序列。
+# 默认采用示例超参数及 GPU1 主卡、GPU0 副卡；两项任务按顺序运行。
 bash scripts/run_asei.sh score --data-name-list YOUR_SERIES.csv
 bash scripts/run_asei.sh label --data-name-list YOUR_SERIES.csv
 ```
@@ -20,9 +20,9 @@ bash scripts/run_asei.sh label --data-name-list YOUR_SERIES.csv
 
 ```bash
 python -B scripts/run_benchmark.py \
-  --config-path asei_detect_label_multi_config.json \
+  --config-path unfixed_detect_label_multi_config.json \
   --model-name self_impl.ASEI \
-  --model-hyper-params '{"multi_gpu":true,"alpha":0.01}' \
+  --model-hyper-params '{"batch_size":128,"lr":0.0001,"num_epochs":10,"win_size":100,"multi_gpu":true}' \
   --gpus 1 0 --eval-backend sequential --num-workers 1 \
   --seed 0 --save-path label/ASEI/seed0
 ```
@@ -34,7 +34,7 @@ python -B scripts/run_benchmark.py \
 调整参数或训练种子：
 
 ```bash
-export ASEI_HYPER_PARAMS='{"multi_gpu":true,"batch_size":64,"alpha":0.01,"checkpoint_dir":"result/asei_checkpoints"}'
+export ASEI_HYPER_PARAMS='{"batch_size":64,"lr":0.0001,"num_epochs":10,"win_size":100,"multi_gpu":true,"checkpoint_dir":"result/asei_checkpoints"}'
 ASEI_SEED=2 bash scripts/run_asei.sh label --data-name-list YOUR_SERIES.csv
 
 # 文档中的五个训练种子，各自产出 TAB 报表。
@@ -45,9 +45,35 @@ done
 
 单卡或 CPU 运行需显式传入 `multi_gpu=false`。`device` 默认 `auto`；指定 `device="cpu"` 可强制 CPU。`device_ids` 是可见设备内的逻辑编号，默认 `[0,1]`。显存不足时先减小 `batch_size`、`correction_batch_size`、`auxiliary_batch_size` 或 `inference_chunk_size`，多卡训练的三个批量参数均至少为 2。
 
+## 可指定超参数
+
+`--model-hyper-params` 接受与 AnomalyTransformer 相同形式的 JSON：
+
+```json
+{"batch_size":128,"lr":0.0001,"num_epochs":10,"win_size":100,"multi_gpu":true}
+```
+
+| 参数 | ASEI 中的含义 | 未指定时 |
+|---|---|---|
+| `batch_size` | 预测器的全局训练批量 | 128 |
+| `predictor_block_size` | 每个训练窗口连续预测的点数；可指定 16 减少重叠窗口的重复计算 | 1；启动脚本采用 16 |
+| `log_interval_seconds` | 各阶段状态日志及心跳间隔，单位秒 | 30 |
+| `lr` | `learning_rate` 的别名，控制预测器学习率 | 0.001 |
+| `num_epochs` | `predictor_epochs` 的别名，控制预测器最大训练轮数，仍适用早停 | 50 |
+| `win_size` | 自历史编码器的实际感受野 W | 原始 TCN 的 63 |
+| `multi_gpu` | 启用可见设备内的数据并行 | false |
+
+`lr`、`num_epochs` 分别与详细参数 `learning_rate`、`predictor_epochs` 对应。同一 JSON 同时指定别名及详细参数时，数值必须一致。补偿 MLP 继续使用 `correction_learning_rate=0.001`、`correction_epochs=20`，评分模块继续使用 `score_learning_rate=0.001`、`score_epochs=30` 和第 5/10/15/20/25/30 轮检查点；这些高级参数也可在 JSON 中单独指定。线性 AR 使用独立的投影优化设置。
+
+指定 `win_size` 时，编码器按该 W 构造精确的因果感受野：保留能完整放入窗口的基础卷积层，再用宽度 2 的因果卷积补足所需历史。`win_size=100` 对应 5 个原有卷积层和 1 个膨胀率 37、宽度 2 的卷积层。关系分支仍使用正滞后历史；默认最大滞后 16、P=4、R=8 时，预测历史为 115 点，完整原始依赖为 126 点。数据划分和独立参考片段用途保持原配置。
+
+`win_size` 改变后，未显式指定的 `recovery_suffix` 和 `validation_gap` 会增加原始依赖长度的变化量，以保留 679 次恢复更新和 1319 次充分分离更新，再应用短序列缩放。显式指定的高级时长参数按传入值执行。实际 W、卷积布局、历史长度和预测器训练参数写入模型元数据。
+
+分块模式将所有有效预测时刻划为不重叠的连续目标块，块顺序随机，每轮每个真实目标仍恰好使用一次；`batch_size=128,predictor_block_size=16` 表示每批 8 个块、最多 128 个预测点。块内仍严格用过去观测预测当前点。尾块只对张量空位置作带掩码的对齐，补齐位置不参与损失，也不补充任何真实训练、参考或辅助轨迹样本。相同目标集合上的预测、Huber 损失及参数梯度与逐点窗口计算一致；分块会改变随机批内目标组合，因此训练轨迹不保证逐次相同。设为 1 可保留原来的逐点窗口采样。`batch_size` 须能被块长整除，双卡训练每批至少有两个块。该选项只改变预测器的计算与批次组织，评分模块的时间递推保持原实现。
+
 ## 评测口径
 
-两份 ASEI 配置均采用 `metrics="all"`，计算并汇总当前 TAB 对应策略注册的全部指标，计算函数没有修改：
+直接使用 TAB 原有的 `unfixed_detect_label_multi_config.json` 和 `unfixed_detect_score_multi_config.json`。两份配置均采用 `metrics="all"`，`report_metrics` 也列出对应策略注册的全部指标，逐序列记录及汇总 CSV 均包含完整指标集合，计算函数保持 TAB 实现：
 
 | 模式 | TAB 指标 |
 |---|---|
@@ -66,7 +92,7 @@ done
 
 未提供独立正常验证集时，TAB 提供的训练部分按时间取前 80% 训练、后 20% 验证。前一部分内部再按 80/10/10 划分预测器拟合、校正器拟合、独立参考三个片段。标准化统计量和滞后图只来自预测器拟合段；完整校正器冻结后才建立参考分布。各段均从自身历史开始构造有效样本，不跨片段借用观测。直接调用时支持 `detect_fit(train_data, valid_data=normal_validation)`。
 
-默认编码器感受野为 63，原始依赖历史为 89 个观测。每条独立测试序列从零状态启动，前 89 个观测不报警，连续分数填充理论下界 `-B-max(kappa_values)`，完整时间轴保留，因此这些时刻不会被从 ADD 中删除。正常验证阈值只统计依赖完整后的有效分数，不使用该填充值。辅助前缀更新开始前须另外建立完整原始历史缓存，长度不随短序列缩放。
+未指定 `win_size` 时，默认编码器感受野为 63，原始依赖历史为 89 个观测。每条独立测试序列从零状态启动，前 `D_raw` 个观测不报警，连续分数填充理论下界 `-B-max(kappa_values)`，完整时间轴保留，因此这些时刻不会被从 ADD 中删除。正常验证阈值只统计依赖完整后的有效分数，不使用该填充值。辅助前缀更新开始前须另外建立完整原始历史缓存，长度不随短序列缩放。
 
 训练顺序为正常预测器、受约束线性校正器、冻结线性参数后的共享补偿 MLP、独立参考估计和辅助评分学习。参数初值、网络结构、经验上尾的相等值处理、分支先融合后中心化、门控投影和投影前读出均按方法文档实现。梯度使用 ReLU 零点的零次梯度和 `torch.amax` 的并列均分。
 
@@ -78,14 +104,14 @@ done
 
 ## 短序列协议
 
-在预测器训练前，按 `s=[1,0.5,0.25,0.125]` 从大到小检查正常预测器拟合片段和验证片段的连续长度，取能完整容纳最长训练轨迹及全部固定验证情景的最大值。选择只使用片段长度和由正常校正片段确定的 `T0`，不依赖随机种子或验证性能。同一实体的候选配置和训练种子使用同一档位。原始数据、划分、`W=63`、`P=4`、`R=8`、最大滞后 16 及独立正常参考片段均保留。
+在预测器训练前，按 `s=[1,0.5,0.25,0.125]` 从大到小检查正常预测器拟合片段和验证片段的连续长度，取能完整容纳最长训练轨迹及全部固定验证情景的最大值。选择只使用片段长度和由正常校正片段确定的 `T0`，不依赖随机种子或验证性能。同一实体、同一模型超参数下，所有候选配置和训练种子使用同一档位。缩放期间原始数据、划分、配置的 W、P、R、最大滞后及独立正常参考片段均保留。
 
 | 有效设置 | 公式 |
 |---|---|
-| 原始缓存历史 | `D_raw=89` |
+| 原始缓存历史 | `D_raw=W+最大滞后-1+P+R-1`；默认 89，`win_size=100` 时为 126 |
 | 正常前缀更新数 | `ceil(640*s)` |
-| 恢复后缀点数 | `89+ceil(679*s)` |
-| 充分分离及再发对间间隔 | `89+ceil(1319*s)` |
+| 恢复后缀点数 | `D_raw+ceil(679*s)` |
+| 充分分离及再发对间间隔 | `D_raw+ceil(1319*s)` |
 | λ 下界 / 上界 / 初值 | `0.8**(1/s)` / `0.98**(1/s)` / `0.9**(1/s)` |
 | 事件长度、密集间隔、再发对内间隔 | `max(1,floor(原长度*s))` |
 
@@ -95,7 +121,7 @@ done
 
 ## 线性 AR 优化
 
-线性主干以全体有效正常校正样本的 Huber₁ 均值为目标，使用 float64 全批量投影梯度下降，权重衰减为 0，最多 1000 次迭代。`beta` 初始化为 0，截距初始化为该片段正常预测误差的均值。预测器、补偿 MLP 和评分模块学习率均为 `1e-3`，线性 AR 不使用 Adam/AdamW。
+线性主干以全体有效正常校正样本的 Huber₁ 均值为目标，使用 float64 全批量投影梯度下降，权重衰减为 0，最多 1000 次迭代。`beta` 初始化为 0，截距初始化为该片段正常预测误差的均值。预测器默认学习率为 `1e-3`，可用 `lr` 指定；补偿 MLP 和评分模块各有独立学习率参数。线性 AR 不使用 Adam/AdamW。
 
 首轮试探步长为 0.01，后续从上一轮成功步长的两倍开始。对每个候选点，将每个通道/预测分支的 `beta` 投影到半径 0.95 的 L1 球，截距不投影；使用排序与软阈值求真正的欧氏投影。检查投影后候选点 `y` 是否满足 `f(y) <= f(x)+<grad f(x),y-x>+||y-x||²/(2*t)`，不满足则将步长减半，float64 比较仅保留机器舍入级容差。
 
@@ -141,3 +167,23 @@ python -B scripts/validate_asei.py --output result/asei_validation/summary.json
 配置与实测记录见 [ASEI_validation.json](ASEI_validation.json)。报告脚本保留默认网络结构、数据划分、独立参考机制和 AR 的 1000 次上限，预测器、补偿 MLP 和六组评分候选各只训练 1 轮，并只保存第 1 轮评分检查点。完整 36 个评分检查点的枚举和并列顺序另由受控损失测试检查。报告如实保存达到上限但未收敛的标志，不能将小规模检查用作基准效果结果。
 
 DataParallel 的批维拆分和主卡参数要求参见 [PyTorch 官方文档](https://docs.pytorch.org/docs/2.12/generated/torch.nn.DataParallel.html)。
+
+## 长时间没有日志时的定位
+
+TAB 的 `scheduling ASEI: 0/1` 统计完整实体任务，模型内部训练不会推进这一外层计数。大实体可长时间保持 0/1。启动日志中的 `W`、训练轮数、批次数和 `predictor_block_size` 用于核对实际参数；未指定 `num_epochs` 时预测器最多训练 50 轮。
+
+模型启动时打印实现标识 `asei-progress-blocks-1` 和实际加载路径。各阶段在开始、首批次、结束以及默认每 30 秒输出进度，含当前阶段、已完成批次、耗时、吞吐和剩余时间估计。即使尚未完成一个批次，后台心跳仍报告当前 Python 阶段，例如取数、传输、前向或反向，`since_progress_s` 表示距离上次完成进度的时间；心跳不增加完成计数，也不代表 CUDA 一定正常。阶段耗时写入 `metadata_["stage_seconds"]`。
+
+按默认 W=63、batch_size=128，316800 点预测器拟合片段有 316722 个有效训练目标，需 2475 个批次；99000 点验证片段需 773 个批次。完整训练和验证均完成后才产生 epoch 汇总。实际速度取决于硬件，GPU 活跃与进程存活不足以单独确认或排除死锁。训练阶段由 label 和 score 两种模式共用，label 指标尚未参与该阶段。
+
+独立检查少量与 SWaT 同通道数的合成批次：
+
+```bash
+uv run python -u scripts/check_asei_runtime.py \
+  --gpus 1 0 --channels 51 --win-size 63 --batch-size 128 \
+  --batches 2 --block-sizes 1 16
+```
+
+该命令不读取数据集，只检查两种窗口组织的前向和反向运行，并输出耗时及当前 PyTorch/设备信息。它用于定位环境与计算阶段，不是完整实验或正式性能比较。CPU 检查可增加 `--device cpu`。
+
+更新服务器时同步整个 `ts_benchmark/baselines/self_impl/ASEI/` 目录及需要使用的脚本。已经启动的 Python 进程继续执行其已加载代码，更新文件后须重新启动任务才能采用新实现。两个双卡基准任务按顺序运行。
