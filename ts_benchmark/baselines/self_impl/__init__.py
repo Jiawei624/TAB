@@ -4,6 +4,7 @@ from importlib import import_module
 
 
 _MODELS = {
+    "ASEI": "ASEI.asei",
     "VAR_model": "VAR.VAR",
     "LOF": "LOF.lof",
     "DCdetector": "DCdetector.DCdetector",

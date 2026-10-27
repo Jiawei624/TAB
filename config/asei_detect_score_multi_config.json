@@ -1,0 +1,20 @@
+{
+    "data_config": {
+        "feature_dict": {"if_univariate": false},
+        "data_set_name": "large_detect"
+    },
+    "model_config": {
+        "models": [],
+        "recommend_model_hyper_params": {}
+    },
+    "evaluation_config": {
+        "metrics": "all",
+        "strategy_args": {"strategy_name": "unfixed_detect_score", "seed": 0}
+    },
+    "report_config": {
+        "aggregate_type": "mean",
+        "report_metrics": ["auc_roc", "auc_pr", "R_AUC_ROC", "R_AUC_PR", "VUS_ROC", "VUS_PR"],
+        "fill_type": "mean_value",
+        "null_value_threshold": 0.3
+    }
+}

@@ -1,0 +1,9 @@
+# ASEI + TAB sequential evaluation and CSV reports. Select a CUDA torch build on the server.
+# This subset avoids installing unrelated baseline model packages.
+numpy>=1.23.5,<3
+pandas>=1.5
+scipy>=1.9
+scikit-learn>=1.2
+statsmodels>=0.14.0
+torch>=2.1
+tqdm>=4.64.0
