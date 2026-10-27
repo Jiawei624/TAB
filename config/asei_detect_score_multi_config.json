@@ -9,7 +9,7 @@
     },
     "evaluation_config": {
         "metrics": "all",
-        "strategy_args": {"strategy_name": "unfixed_detect_score", "seed": 0}
+        "strategy_args": {"strategy_name": "unfixed_detect_score", "seed": 2026}
     },
     "report_config": {
         "aggregate_type": "mean",

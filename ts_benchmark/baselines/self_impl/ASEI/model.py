@@ -23,29 +23,36 @@ def project_l1_(values, radius):
     """Euclidean projection onto an L1 ball, independently along the last axis."""
     magnitude = values.abs()
     ordered = magnitude.sort(dim=-1, descending=True).values
-    cumulative = ordered.cumsum(-1) - radius
+    # Translation by the maximum avoids cancellation in |v|-theta for large FP32 v.
+    largest = ordered[..., :1]
+    shifted = ordered - largest
+    cumulative = shifted.cumsum(-1) - radius
     indices = torch.arange(1, values.shape[-1] + 1, device=values.device)
-    active = ordered > cumulative / indices
+    active = shifted > cumulative / indices
     count = active.sum(-1, keepdim=True).clamp_min(1)
-    threshold = (cumulative.gather(-1, count - 1) / count).clamp_min(0)
-    values.copy_(values.sign() * (magnitude - threshold).clamp_min(0))
+    threshold = cumulative.gather(-1, count - 1) / count
+    projected = values.sign() * (magnitude - largest - threshold).clamp_min(0)
+    values.copy_(torch.where(magnitude.sum(-1, keepdim=True) <= radius, values, projected))
 
 
-def lag_graph(values, lags, neighbors):
-    """All aligned observations; ties: correlation, smaller lag, smaller source."""
+def lag_graph(values, lags, neighbors, sample_cap=65536):
+    """Common deterministic target anchors; ties: smaller lag, smaller source."""
     values = np.asarray(values, dtype=np.float64)
     channels = values.shape[1]
     best = np.zeros((channels, channels), dtype=np.float64)
     selected_lag = np.ones((channels, channels), dtype=np.int64)
+    anchors = np.arange(max(lags), len(values))
+    if len(anchors) > sample_cap:
+        anchors = anchors[np.floor((np.arange(sample_cap) + 0.5) * len(anchors) / sample_cap).astype(int)]
     for lag in sorted(lags):
-        target, source = values[lag:], values[:-lag]
+        target, source = values[anchors], values[anchors - lag]
         target = target - target.mean(0)
         source = source - source.mean(0)
         denominator = np.sqrt((target * target).sum(0)[:, None]
                               * (source * source).sum(0)[None, :])
         correlation = np.divide(target.T @ source, denominator,
                                 out=np.zeros_like(best), where=denominator > 0)
-        correlation = np.clip(np.abs(correlation), 0, 1)
+        correlation = np.nan_to_num(np.clip(np.abs(correlation), 0, 1), nan=0, posinf=0, neginf=0)
         np.fill_diagonal(correlation, 0)
         improved = correlation > best
         selected_lag[improved] = lag
@@ -71,12 +78,13 @@ class CausalBlock(nn.Module):
     def __init__(self, hidden, kernel, dilation):
         super().__init__()
         self.left = (kernel - 1) * dilation
-        self.conv = nn.Conv1d(hidden, hidden, kernel, dilation=dilation)
+        self.conv = nn.Conv1d(hidden, hidden, kernel, dilation=dilation, groups=hidden)
         self.norm = nn.LayerNorm(hidden)
+        self.mix = nn.Linear(hidden, hidden)
 
     def forward(self, values):
-        values = self.conv(F.pad(values, (self.left, 0)))
-        return F.gelu(self.norm(values.transpose(1, 2))).transpose(1, 2)
+        hidden = self.conv(F.pad(values, (self.left, 0))).transpose(1, 2)
+        return values + F.gelu(self.mix(self.norm(hidden))).transpose(1, 2)
 
 
 def temporal_layout(kernel, dilations, window=None):
@@ -132,7 +140,8 @@ class Predictor(nn.Module):
         related = encoded[:, source_times, self.sources[None]]
         weights = torch.softmax(self.edge_logits.masked_fill(~self.edge_mask, -1e9), -1)
         weights = weights * self.edge_mask
-        pooled = (self.graph_projection(related) * weights[None, None, ..., None]).sum(-2)
+        weights = weights / weights.sum(-1, keepdim=True).clamp_min(torch.finfo(weights.dtype).tiny)
+        pooled = self.graph_projection((related * weights[None, None, ..., None]).sum(-2))
         head_embedding = self.embedding.weight[None, None].expand(batch, output_steps, -1, -1)
         own = self.self_head(torch.cat((own, head_embedding), -1)).squeeze(-1)
         related = self.rel_head(torch.cat((pooled, head_embedding), -1)).squeeze(-1)
@@ -143,19 +152,20 @@ class ErrorCorrector(nn.Module):
     def __init__(self, channels, order, rho):
         super().__init__()
         self.rho = rho
-        self.bias = nn.Parameter(torch.zeros(channels, 2, dtype=torch.float64))
-        self.beta = nn.Parameter(torch.zeros(channels, 2, order, dtype=torch.float64))
+        self.bias = nn.Parameter(torch.zeros(channels, 2))
+        self.beta = nn.Parameter(torch.zeros(channels, 2, order))
         self.mlp = nn.Sequential(nn.Linear(order, 8), nn.GELU(), nn.Linear(8, 1))
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
         self.register_buffer("log_mean", torch.zeros(channels, 2, order))
         self.register_buffer("log_scale", torch.ones(channels, 2, order))
         self.register_buffer("eta", torch.zeros(channels, 2))
+        self.register_buffer("error_scale", torch.ones(channels, 2))
 
     def forward(self, history, nonlinear=True):
-        predicted = self.bias + (history.to(self.beta.dtype) * self.beta).sum(-1)
+        predicted = self.bias + (history * self.beta).sum(-1)
         if nonlinear:
-            normalized = (torch.log1p(history.to(self.log_mean.dtype)) - self.log_mean) / self.log_scale
+            normalized = (torch.log1p(history) - self.log_mean) / self.log_scale
             predicted = predicted + self.eta * torch.tanh(self.mlp(normalized).squeeze(-1))
         return predicted
 
@@ -166,21 +176,29 @@ class ErrorCorrector(nn.Module):
 
 class EvidenceScorer(nn.Module):
     def __init__(self, bound, omega_min, lambda_min, lambda_max, lambda_init,
-                 kappa, temperature, recurrence_backend="scripted"):
+                 kappa_init=0.02, temperature=0.25, recurrence_backend="scan",
+                 kappa_min=0.01, kappa_max=0.20, scan_chunk_size=256):
         super().__init__()
         self.bound, self.omega_min = bound, omega_min
         self.lambda_min, self.lambda_max = lambda_min, lambda_max
-        self.kappa, self.temperature = kappa, temperature
+        self.kappa_min, self.kappa_max, self.temperature = kappa_min, kappa_max, temperature
         self.recurrence_backend = recurrence_backend
+        self.scan_chunk_size = scan_chunk_size
         self.gate_weight = nn.Parameter(torch.zeros(4))
         self.gate_bias = nn.Parameter(torch.zeros(()))
         probability = (lambda_init - lambda_min) / (lambda_max - lambda_min)
         self.decay_logit = nn.Parameter(torch.tensor(math.log(probability / (1 - probability))))
+        probability = (kappa_init - kappa_min) / (kappa_max - kappa_min)
+        self.kappa_logit = nn.Parameter(torch.tensor(math.log(probability / (1 - probability))))
         self.training_bias = nn.Parameter(torch.zeros(()))
 
     @property
     def decay(self):
         return self.lambda_min + (self.lambda_max - self.lambda_min) * self.decay_logit.sigmoid()
+
+    @property
+    def kappa(self):
+        return self.kappa_min + (self.kappa_max - self.kappa_min) * self.kappa_logit.sigmoid()
 
     def integrate(self, features, state=None):
         # features: independent sequences, time, channels, [ec, es, mean_ec, mean_es].
@@ -189,7 +207,7 @@ class EvidenceScorer(nn.Module):
         evidence = omega * features[..., 0] + (1 - omega) * features[..., 1]
         if state is None:
             state = evidence.new_zeros((evidence.shape[0], evidence.shape[2]))
-        return integrate(evidence, self.decay, state, self.kappa, self.recurrence_backend)
+        return integrate(evidence, self.decay, state, self.kappa, self.recurrence_backend, self.scan_chunk_size)
 
     def forward(self, paired_features):
         # Each original/perturbed pair shares one independently initialized state.

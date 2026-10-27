@@ -1,162 +1,154 @@
-# ASEI 使用说明
+# ASEI 运行与配置
 
-实现依据工作区的 `In1_1_3.md`，入口为 `self_impl.ASEI`。数据加载、测试边界、评价函数和结果汇总沿用 TAB。ASEI 在一张 CUDA GPU 上运行；没有 CUDA 时，`device="auto"` 回退至 CPU。
+实现依据工作区的 [In1_1_4.md](../../In1_1_4.md) 和 [impl.md](../../impl.md)，TAB 入口为 `self_impl.ASEI`。每个文件分别拟合预测器、校正器、评分器和阈值。模型使用一张 CUDA GPU；`device="auto"` 在 CUDA 不可用时使用 CPU。完整默认值见 [Config](../ts_benchmark/baselines/self_impl/ASEI/asei.py)，实现版本为 `asei-finite-bank-scan-3`。
 
-## 安装与运行
+## 服务器运行
 
-在 TAB 仓库根目录运行。服务器先安装适配的 CUDA 版本 PyTorch，再安装依赖：
+以下命令在 TAB 仓库根目录执行。先安装服务器 CUDA 环境配套的 PyTorch；其余运行和验收依赖列在 [requirements-asei.txt](../requirements-asei.txt)，不要求替换已有锁定版本。
 
 ```bash
-uv pip install -r requirements-asei.txt
 mkdir -p log
 
-nohup uv run python -u scripts/run_benchmark.py \
+nohup uv run python -u ./scripts/run_benchmark.py \
   --config-path unfixed_detect_label_multi_config.json \
-  --model-name self_impl.ASEI --data-name-list SWAT.csv \
-  --model-hyper-params '{"batch_size":128,"lr":0.001,"num_epochs":50,"win_size":63,"predictor_block_size":16,"alpha":0.01,"log_interval_seconds":30,"checkpoint_dir":"result/asei_checkpoints/SWAT_label_seed42"}' \
-  --seed 42 --eval-backend sequential --gpus 1 --num-workers 1 \
+  --model-name self_impl.ASEI \
+  --data-name-list SWAT.csv \
+  --model-hyper-params '{"device":"auto","seed":42,"lr":0.001,"num_epochs":20,"win_size":63,"alpha":0.01,"checkpoint_dir":"result/asei_checkpoints/SWAT_label_seed42"}' \
+  --seed 42 \
+  --eval-backend sequential \
+  --gpus 1 \
+  --num-workers 1 \
   --save-path label/ASEI_SWaT_seed42 \
-  > log/asei_swat_label_seed42.log 2>&1 &
+  > ./log/asei_swat_label_seed42.log 2>&1 &
 ```
 
-上述任务结束后运行分数评测：
+另一个评测入口：
 
 ```bash
-nohup uv run python -u scripts/run_benchmark.py \
+nohup uv run python -u ./scripts/run_benchmark.py \
   --config-path unfixed_detect_score_multi_config.json \
-  --model-name self_impl.ASEI --data-name-list SWAT.csv \
-  --model-hyper-params '{"batch_size":128,"lr":0.001,"num_epochs":50,"win_size":63,"predictor_block_size":16,"alpha":0.01,"log_interval_seconds":30,"checkpoint_dir":"result/asei_checkpoints/SWAT_score_seed42"}' \
-  --seed 42 --eval-backend sequential --gpus 1 --num-workers 1 \
+  --model-name self_impl.ASEI \
+  --data-name-list SWAT.csv \
+  --model-hyper-params '{"device":"auto","seed":42,"lr":0.001,"num_epochs":20,"win_size":63,"alpha":0.01,"checkpoint_dir":"result/asei_checkpoints/SWAT_score_seed42"}' \
+  --seed 42 \
+  --eval-backend sequential \
+  --gpus 1 \
+  --num-workers 1 \
   --save-path score/ASEI_SWaT_seed42 \
-  > log/asei_swat_score_seed42.log 2>&1 &
+  > ./log/asei_swat_score_seed42.log 2>&1 &
 ```
 
-`--gpus 1` 暴露物理 GPU1，模型在其逻辑 `cuda:0` 上执行。CPU 运行可在 JSON 中加入 `"device":"cpu"`。模型不接受 `multi_gpu` 和 `device_ids`，不创建训练副本。`--num-workers` 是 TAB 的实体任务设置；模型 DataLoader 工作进程数由 JSON 的 `num_workers` 控制，默认 0。
+`--gpus 1` 将物理 GPU1 映射为逻辑 `cuda:0`。CPU 可显式指定 JSON `"device":"cpu"`。TAB 的 `--seed` 与模型 JSON 的 `seed` 在上述命令中均为 42；模型独立使用 JSON 的种子，默认是 2026。两个评测进程各自训练一遍。
 
-也可使用入口脚本：
+原始两个 TAB 配置保持 `metrics="all"`：label 评测及报告包含全部 16 个原有指标，score 包含全部 6 个原有指标。VUS_ROC/PR 在一次评测内共用曲线计算，数值和指标定义不变。
+
+入口脚本使用同一默认方法：
 
 ```bash
 ASEI_GPU=1 ASEI_SEED=42 bash scripts/run_asei.sh label --data-name-list SWAT.csv
 ASEI_GPU=1 ASEI_SEED=42 bash scripts/run_asei.sh score --data-name-list SWAT.csv
 ```
 
-脚本默认采用文档起始配置：预测器学习率 0.001、最多 50 轮、W=63，评分模块 30 轮，补偿 MLP 20 轮。`ASEI_HYPER_PARAMS` 可替换默认 JSON。两种评测分别训练一次；模型文件包含全部评分检查点和运行统计量。
+`ASEI_HYPER_PARAMS` 可以替换脚本默认 JSON；替换时应显式保留所需的模型 `seed`。TAB 的 `--num-workers` 控制实体任务，模型 JSON 的 `num_workers` 控制 DataLoader，默认 0。
 
-## 数据划分
+## 数据、预处理与时间索引
 
-TAB 根据 `dataset/anomaly_detect/DETECT_META.csv` 的 `train_lens` 保留官方训练/测试边界。ASEI 不读取测试数据或标签以拟合模型、选择配置或估计阈值。
+TAB 依据 `DETECT_META.csv` 的 `train_lens` 保留官方训练/测试边界。ASEI 不读取 `train_label`。每次输入代表同一实体的一段连续观测，不拼接独立实体补足长度。
 
-| 数据部分 | 划分与用途 |
+没有外部验证输入时，设官方训练输入长 N：
+
+| 片段 | 零基左闭右开边界 | 用途 |
+|---|---|---|
+| F | [0, floor(0.8×floor(0.8N))) | 预处理、图、预测器、训练任务 |
+| Cfit | [F末端, floor(0.9×floor(0.8N))) | 校正器及 T0 |
+| Rref | [Cfit末端, floor(0.8N)) | 独立正常参考 |
+| Vsel | 验证部分前 floor(len(V)/2) 点 | 正常预测早停、固定扰动评分早停 |
+| Vcal | 验证部分其余点 | 模型全部选定后估计阈值 |
+
+若调用 `detect_fit(..., valid_data=...)`，整个训练输入作为建模部分，内部仍为 80%/10%/10%；外部验证输入平分为 Vsel/Vcal。所有片段独立预热。
+
+F 的逐列有限值中位数作为因果填充初值，全缺失列初值为零并记录。NaN/±Inf 前向填充；独立片段重置填充历史。均值、总体标准差仅从填充后的 F 估计，常量列标准差置为 1 并保留。流式调用延续最后有限原始值，不使用后向填充。
+
+默认 W=63，最大图滞后 16，H=W+16−1=78，AR 阶数 P=4，滚动长度 R=8。首预测索引为 H，首校正/参考索引为 H+P=82，首完整分数索引 D=H+P+R−1=89。参考段不额外扣除 R−1。
+
+F 至少有 256 个有效预测目标；Cfit 至少有 64 个校正目标；Rref 至少有 128 个参考点；Vcal 至少有 128 个完整分数；F/Vsel 还须容纳辅助轨迹。长度不足时明确报出片段，保留原始采样率和时间位置。
+
+## 模型与训练预算
+
+容量仅由 F 长度解析；显式提供的配置覆盖自动值。
+
+| 条件 | hidden_dim | predictor_block_size Q | batch_size Bp | auxiliary_train_pairs |
+|---|---:|---:|---:|---:|
+| len(F)<8192 | 16 | 128 | 4 | 96 |
+| len(F)≥8192 | 32 | 256 | 8 | 384 |
+
+`batch_size` 的单位是连续目标块数。例如 SWAT 默认每批 8 块、每块 256 个目标；不能沿用其他模型的 128 个窗口含义。每轮打乱目标块，并覆盖 [H,len(F)) 每个目标一次；尾块携带 mask。按 SWAT 的 495000 点训练输入计算，每轮预测器有 155 次更新，此数仅为算术预算。
+
+预测器使用通道共享的残差深度时间卷积、当前时刻隐藏维 LayerNorm 和逐点线性混合。关系边先汇集隐藏表示，再作无偏置投影。图只在 F 上估计；超过 65536 个目标时采用所有滞后共用的确定性等距锚点，预测器仍使用全部原始目标。51 通道、d=32 的预测器有 10886 个参数；18 通道、d=16 时为 3306。
+
+| 阶段 | 默认优化 |
 |---|---|
-| 官方测试集 | 原始 train_lens 边界之后的数据，模型冻结后评价 |
-| D_tr | 没有独立正常验证集时，取官方正常训练部分的前 80% |
-| D_val | 取官方正常训练部分的后 20%；用于正常预测早停、辅助配置选择和最终正常阈值 |
-| 预测器拟合段 | D_tr 的前 80%；拟合标准化、滞后图和预测器，并抽取辅助基础轨迹 |
-| 校正器拟合段 | D_tr 的随后 10%；拟合线性 AR、补偿统计量和共享 MLP |
-| 独立正常参考段 | D_tr 的最后 10%；完整校正器冻结后建立 d/r 分布和中心化统计量 |
+| 预测器 | AdamW，lr=1e-3，weight_decay=1e-4；最多20轮，至少5轮，patience=4 |
+| 线性校正 | FP32 Adam，lr=1e-2，weight_decay=0；100次更新，每次 beta 真正投影到 L1 半径0.95球 |
+| 共享非线性补偿 | 冻结线性项；Adam，lr=1e-3，weight_decay=0；100次更新 |
+| 评分器 | 一个模型，8个可学习标量；Adam，lr=1e-3，weight_decay=0；最多10轮，至少3轮，patience=3，梯度裁剪1 |
 
-官方正常训练部分有 495000 点时，D_tr 为 396000 点，D_val 为 99000 点；D_tr 内部分别为 316800、39600、39600 点。先按原始时间轴划分，再构造窗口；各段缓存从自身开始，不跨段借用观测或拼接实体。
+校正器按通道和分支估计 `scale=max(mean(d),IQR(d),1e-4)`，在 y=d/scale 上训练。beta 初始为零，截距为全部 y 的中位数；共享 MLP 为 P→8→1，输出层零初始化，eta=0.1×IQR(y)。两阶段批量至多 2048 个时刻，固定种子排列、尾批保留。最终 r=scale×(y−y_hat)，不对 y_hat 截断。日志保存更新数、处理样本数、首末损失和最大 beta L1 范数；固定预算不等同于精确收敛。
 
-基准另有正常验证序列时，支持 `detect_fit(normal_train, valid_data=normal_validation)`：验证序列保持独立，不再从 normal_train 中扣出 20%；训练内部仍按 80/10/10 划分。train_label 不用于拟合，输入正常训练数据需满足方法假设。
+独立参考保存全部 d/r 的 FP32 排序值。尾部查询使用左插入位置，把相等值计入上尾；两个预测分支先取最大证据，再中心化。参考自查询使用同一路径，均值 FP64 累积、中心保存 FP32。记录参考点数及 log(Nref+1)。
 
-## 历史缓存与参考样本
+评分器学习门控4个权重、门控偏置、lambda logit、kappa logit、训练偏置，共8个标量。lambda=0.8+0.18×sigmoid(logit)，初始0.9；kappa=0.01+0.19×sigmoid(logit)，初始0.02。损失固定 Ldet+Lrank，先在每个任务内计算，再对任务等权平均；验证按三个扰动族×两种布局的6组等权汇总。每轮验证，完全同分保留更早模型。
 
-令 `H=W+ell_max-1`，以下偏移均为片段内零基索引：
+`lr/learning_rate` 与 `num_epochs/predictor_epochs` 是别名，冲突时报错；只控制预测器，不改变其他阶段预算。`win_size` 是精确感受野，支持任意正整数，随之重算 H、D 和任务长度。`predictor_amp="bf16"` 仅在支持 BF16 的 CUDA 上显式启用；冻结证据、参考、评分、校准和部署保持 FP32，并禁用 TF32。未知参数及旧网格、多卡、全量回溯参数明确报错。
 
-| 输出或统计量 | 首个有效索引 | 默认 W=63、ell_max=16、P=4、R=8 |
-|---|---:|---:|
-| 预测误差 d | H | 78，即第 79 个观测 |
-| 配对参考 d/r | H+P | 82，即第 83 个观测 |
-| 完整在线分数 | D_raw=H+P+R-1 | 89，即第 90 个观测 |
+## 有限任务、证据缓存与扫描
 
-独立参考段使用自身前 H 个原始观测、随后 P 个误差建立预测和 AR 缓存，收集 `N_ref-H-P` 个对齐的 d/r 样本。参考数组不需要滚动证据窗口 R；R 只参与完整评分缓存。中心化均值在同一批有效参考点上计算。元数据记录 reference_warmup、reference_first_observation、reference_points 和 score_warmup。
+令 M=min(len(F),len(Vsel))，仅按正常长度和 Cfit 的 T0 确定：
 
-正常验证阈值使用依赖完整后的有效分数。独立测试从零状态启动，前 D_raw 点不报警，分数填充理论下界以保留完整时间轴，这些时间仍计入 ADD。流式输入延续历史及状态。
-
-## 辅助扰动与固定验证实例
-
-正常和扰动轨迹共享前缀及事件后的原始观测。事件标签保持预定区间，首末点必须确有观测变化。局部常值导致错位无效时，程序从同一正常片段重新抽取有效基础轨迹，保留扰动族、子类型、事件布局和幅度。
-
-错位任务先用每个事件首末点的滞后变化掩码筛除必然无效的位置，再按任务自身种子确定候选顺序。困难正常任务的重采样仍优先取有效候选中正常状态证据较高的轨迹。最多尝试 perturbation_base_attempts=128 个新基础轨迹；没有有效位置或尝试耗尽时明确报错，不把未改变的轨迹当作异常。
-
-验证种子固定为 1001、1002。默认 72 个实例覆盖 3 个扰动族、4 个情景、3 个幅度和 2 个种子。位置、最终扰动种子、事件布局及重采样次数在预测器训练前确定并记录，不依赖训练种子、候选、检查点或测试数据。相同任务描述可以重建相同扰动数组。
-
-## 短序列与逐实体选择
-
-按 `s=1,0.5,0.25,0.125` 检查正常预测器拟合段和验证段长度，选取能完整容纳训练轨迹及全部验证情景的最大档位。s 不参与性能选优，同一实体和模型参数下各训练种子、候选使用相同档位。
-
-| 有效设置 | 默认时间预算的缩放公式 |
-|---|---|
-| 前缀完整更新数 | ceil(640*s)，其前另有完整原始缓存 |
-| 恢复后缀 | D_raw+ceil(679*s) |
-| 充分分离间隔 | D_raw+ceil(1319*s) |
-| lambda_min / max / init | 0.8**(1/s) / 0.98**(1/s) / 0.9**(1/s) |
-| 事件长度、密集和再发对内间隔 | max(1,floor(原长度*s))，长度集合去重 |
-
-缩放不改变原始数据、W/P/R、最大滞后、三类划分或独立参考段。短/长/密集情景各保留 3 个事件，再发保留两对。最小档仍无法容纳，或拟合、参考段无有效样本时明确报错。张量批次的掩码对齐不增加真实样本，不用于补足辅助轨迹。
-
-每个实体独立训练六组 `(kappa,gamma_rank)`：`(0.01,0.5),(0.01,1),(0.02,0.5),(0.02,1),(0.04,0.5),(0.04,1)`。保存第 5、10、15、20、25、30 轮权重。训练目标为 `L_det+gamma_rank*L_rank`，验证始终用 `L_det+L_rank`，按扰动族和情景等权汇总；并列先取较早检查点，再取较早配置。MLP 仅在同一实体内跨通道及预测分支共享。
-
-选定模型后，正常验证序列顺序输出 N 个有效分数。固定 alpha=0.01，K=floor(alpha*N)，阈值为升序分数第 N-K-1 项，严格使用 S>h。允许负阈值，同分时实际误报可小于 K。保存 N、K、阈值和实际计数。
-
-## 优化与参数
-
-| 参数 | 含义与默认值 |
-|---|---|
-| lr / learning_rate | 预测器学习率 0.001；同时指定别名时须一致 |
-| num_epochs / predictor_epochs | 预测器最多 50 轮，正常验证早停 patience=5 |
-| win_size | 自历史感受野 W；默认五层 TCN 的 63，可指定正整数 |
-| batch_size | 每批最多 128 个真实预测目标 |
-| predictor_block_size | 默认 1，脚本采用 16 以复用连续目标的卷积计算 |
-| correction_epochs / score_epochs | 20 / 30 |
-| correction_learning_rate / score_learning_rate | 均为 0.001 |
-| validation_cache_mb | 固定验证证据的设备缓存上限，默认 256 MiB，超出部分临时写盘 |
-| recurrence_backend | scripted，reference 保留原循环作为对照 |
-| device | auto，自动选择一张 CUDA GPU 或 CPU，可显式指定 cpu、cuda:0 |
-| log_interval_seconds | 默认 30 秒 |
-
-win_size 构造精确因果感受野；W=100 时原始依赖为 126 点，恢复和分离时长随之调整。分块模式保证每轮每个有效目标恰好一次，尾块对齐位置不计入损失。同一目标集合上的输出、Huber 损失和梯度与逐点窗口一致，但随机批内组合改变；设为 1 可保留原采样。
-
-冻结预测器后的误差、校正、上尾查询和滚动证据留在同一设备，避免这些步骤间来回传输完整数组。MLP 训练复用驻留历史和目标，只传小批索引。固定验证证据每实体只构建一次，供所有候选及检查点复用；缓存不足时临时写盘，实体结束后清理，不跨实体共享。
-
-评分采用脚本化顺序递推及显式一阶伴随，保持式（13）的顺序、ReLU 零点的零次梯度和最大通道并列均分梯度，避免逐时刻构建 Python 自动微分图。reference 后端用于数值、梯度及性能对照。
-
-线性 AR 使用 float64 全批量投影梯度下降，Huber 阈值 1，权重衰减 0，最多 1000 次，首次步长 0.01、回溯因子 0.5，后续从上轮成功步长两倍开始。beta 投影到半径 0.95 的 L1 球，截距不投影，检查投影后的标准二次上界下降条件。映射无穷范数不超过 1e-5 时收敛，否则到上限后记录未收敛。冻结线性参数后才训练 MLP。
-
-## 评价与检查点
-
-使用 TAB 原有的 unfixed_detect_label_multi_config.json 和 unfixed_detect_score_multi_config.json，报表包含全部 16 个二值指标及 6 个分数指标。auc_pr 保持 Average Precision，ADD 使用原始在线报警。同一次评价中的 VUS_ROC 和 VUS_PR 共享一次 generate_curve 调用，公式及结果不变，缓存不跨序列或评价调用。
-
-```python
-from ts_benchmark.baselines.self_impl import ASEI
-
-model = ASEI(device="auto", predictor_block_size=16)
-model.detect_fit(normal_train, valid_data=normal_validation)
-labels, scores = model.detect_label(test)
-model.save("result/asei.pt")
-
-loaded = ASEI.load("result/asei.pt", device="cpu")
-loaded.reset_state()
-labels_1, scores_1 = loaded.detect_stream(chunk_1)
-labels_2, scores_2 = loaded.detect_stream(chunk_2)
+```text
+Npre = min(128, floor((M-D)/8))
+Nrec = D+32
+G = rolling_window
+Lcap = min(16*T0, floor((M-D-Npre-Nrec-G)/2))
+lengths = 去重并排序 min(Lcap, l)，l ∈ {1,max(1,T0/4),T0,4*T0,16*T0}
 ```
 
-detect_score 返回 (scores,scores)，detect_label 和 detect_stream 返回 (labels_dict,scores)。前两者每次重置序列，流式接口保留状态。检查点保存模型、预处理、参考数组、协议、全部评分检查点和阈值，可在 CPU 与单卡之间加载。元数据包含数据 SHA256、划分边界、历史就绪偏移、缓存构建数、阶段耗时、依赖版本和 AR 收敛状态。
+Npre<0 或 Lcap<1 时报错。单事件与等长双事件再发布局等权；双事件间隔 G，共享通道组，独立抽取启动延迟和扰动参数。事件前包含 D 点原始预热和 Npre 次正常状态更新，之后有 Nrec 点恢复。3604 点输入的默认划分产生 Vsel=360、Vcal=361；T0=8 时 Npre=33、Lcap=54，最长双事件轨迹359点。
 
-## 验证与日志排查
+训练库默认96/384对，验证库固定48对。三种扰动族与两种布局均衡分配，子类型均衡、事件长度循环分配。验证专用种子固定任务；训练一半均匀取位置，一半从16个候选位置正常强度最高四分位抽取。困难度查 F 正常证据前缀和。错位扰动从原始正常副本读取过去值，事件首末点必须改变；确定性重试最多128次，局部常值时重新取有效基础位置，无法构造则报错。
+
+F、Vsel 正常证据各顺序计算一次。所有扰动在观测空间施加，然后经过完整冻结模型。缓存形状为 [2,Lraw−H−P,C,2]，包含首完整分数之前的 R−1 个证据，视角顺序为校正/状态。按批使用 avg_pool1d 生成滚动均值，避免长序列 FP32 累加和相减。评分训练只读取缓存，不调用预测器、校正器或 searchsorted。
+
+两库共用256 MiB GPU缓存预算和1024 MiB主机预算；超限写入工作目录下的临时 .npy 映射文件。文件原子写入，检查形状、dtype和校验和。键包含数据和列序、边界、预处理、模型、图、参考、任务清单、配置、精度及版本。每次拟合构建独立临时库，结束释放，不依赖跨运行缓存。记录：
+
+- `normal_evidence_passes=2`：F、Vsel各一次。
+- `changed_trajectory_builds=M_A+M_V`：成功完成的扰动轨迹数。
+- `score_epoch_feature_extractor_calls=0`：评分训练期间不重复提取证据。
+
+状态更新 m=ReLU(lambda×m_prev+u−kappa)，分数取激活量 a 的通道最大值，保留负分数。正式后端为 max-affine 倍增前缀扫描，自定义一阶反向使用仿射扫描；默认每256个分数一块，块间传递实际状态和初态梯度，不 detach 正常前缀。`reference` 顺序后端只用于核验。两后端按容差一致，不承诺浮点逐位相同；校准与部署固定相同后端、块长和精度。
+
+## 阈值、流式接口与持久化
+
+模型参数全部选定后，仅在 Vcal 上从零状态运行完整流程。默认 alpha=0.01；K=floor(alpha×N)，取升序分数零基索引 N−K−1 为阈值，严格 S>h 报警，允许负阈值。保存 N、K、h、实际超阈点数、实际比例及1/N。并列不加噪声。TAB 的 `anomaly_ratio` 使用百分数，显式给出时覆盖 alpha；多个比例各自校准，不根据测试表现选择。
+
+`detect_score` 返回 (scores,scores)，`detect_label` 返回 ({百分数:labels},scores)。两者每次冷启动；`detect_stream` 保留缺失填充状态、最多D个标准化观测和非负递推状态，`reset_state` 开始新序列。输出与输入等长，`last_ready_mask_` 标记完整分数；首D点输出−6.2、报警0。任意计算分块不重复更新历史。
+
+默认输出原始带符号分数。`score_transform="bounded"` 显式启用固定理论界的线性变换；默认界为 [−6.2,299.5]，阈值同时变换，不使用测试 min/max。
+
+`save/load` 使用 format_version=3，保存完整解析配置、预处理、列序、三个模型、参考、任务描述、种子、阈值和运行元数据。加载不重新估计统计量，模型冻结、流状态清空。旧格式模型需要重新拟合；临时证据库不属于 checkpoint 的运行依赖。
+
+## 小规模验收
+
+```powershell
+& 'E:\Miniconda3\Scripts\conda.exe' run -n codex python -B -m pytest tests -q
+& 'E:\Miniconda3\Scripts\conda.exe' run -n codex python -B scripts/validate_asei.py --device cpu --output docs/ASEI_validation.json
+```
+
+服务器单卡正确性及小规模计时：
 
 ```bash
-uv run python -B -m unittest discover -s tests -p 'test_asei*.py' -v
-uv run python -B scripts/validate_asei.py --device cpu --output result/asei_validation/summary.json
-
-# 有一张 CUDA GPU 时补充检查。
-CUDA_VISIBLE_DEVICES=1 uv run python -B -m unittest discover -s tests -p 'test_asei*.py' -v
-uv run python -u scripts/check_asei_runtime.py --gpus 1 --channels 51 --win-size 63 \
-  --batch-size 128 --batches 2 --block-sizes 1 16 --score-steps 256
+uv run python -B scripts/check_asei_runtime.py --gpus 1 --device auto --channels 51 --batch-size 8 --block-sizes 128 256
+CUDA_VISIBLE_DEVICES=1 uv run python -B -m pytest tests/test_asei_core.py tests/test_asei.py -q
 ```
 
-测试覆盖划分、参考就绪、局部常值重采样、验证复现、单样本尾批、设备证据与 NumPy 对照、递推输出及一阶梯度（含并列和零点）、缓存复用、VUS 数值和 TAB 报表链路。本地记录见 [ASEI_validation.json](ASEI_validation.json)。合成小样本减少了训练轮次，不是完整基准效果结果。
-
-日志标识为 asei-single-device-2，显示加载路径、参数、阶段、批次和心跳。TAB 的 scheduling 0/1 统计完整实体任务。提供的服务器日志在最后一批出现 forward() missing history，来自多卡分发中的空输入副本；本实现直接在单卡接收该尾批次。
-
-更新服务器时同步完整 ASEI 目录、评价模块、配置和脚本，重新启动任务以采用新代码。
+测试包含顺序/扫描前向和全部一阶梯度、ReLU零点和通道并列、跨块梯度、长10000点FP32误差、预测因果性、尾块覆盖、参考并列、L1投影、任务重建、缓存损坏、Vcal隔离、流式缺失填充、保存重载以及TAB全部指标和CSV报告。小规模测量见 [ASEI_validation.json](ASEI_validation.json)，不代表完整数据集精度或服务器加速结果。

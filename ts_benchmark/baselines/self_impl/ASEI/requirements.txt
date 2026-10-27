@@ -1,0 +1,6 @@
+# Standalone ASEI implementation and verification. TAB evaluation also needs requirements-asei.txt.
+# Install a PyTorch build appropriate for the server's CUDA environment.
+numpy>=1.23.5,<3
+pandas>=1.5
+torch>=2.1
+pytest>=7

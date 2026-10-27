@@ -1,89 +1,82 @@
-"""Run two small synthetic ASEI fits and record effective protocols and AR status."""
-
+"""Run two small complete fits, including the 3604-point short-record case."""
 import argparse
 from dataclasses import asdict
+import hashlib
 import json
 from pathlib import Path
 import sys
-
+import tempfile
 import numpy as np
 import pandas as pd
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from ts_benchmark.baselines.self_impl import ASEI
 from ts_benchmark.baselines.self_impl.ASEI.asei import Config
-from ts_benchmark.baselines.self_impl.ASEI.protocol import PROTOCOL_SCALES, make_protocol
+from ts_benchmark.baselines.self_impl.ASEI.progress import IMPLEMENTATION_VERSION
 from check_asei_runtime import check_recurrence
 
 
-def normal_series(length, phase=0):
-    time = np.arange(length, dtype=np.float64) + phase
-    return pd.DataFrame({"a": np.sin(time / 7) + 0.1 * np.cos(time / 3),
-                         "b": np.cos(time / 11) + 0.2 * np.sin(time / 7)})
+def normal_series(length,seed):
+    x = np.random.default_rng(seed).normal(size=(length,3))
+    for t in range(1,length):
+        x[t] += .55*x[t-1]
+    return pd.DataFrame(x,columns=["a","b","c"])
 
 
-def validate(output, device="auto"):
+def validate(output,device="auto"):
     torch.set_num_threads(2)
-    defaults = Config()
-    table = []
-    for factor in PROTOCOL_SCALES:
-        protocol = make_protocol(defaults, 89, 8, factor)
-        training, scenarios = protocol.required_lengths()
-        table.append(dict(protocol=asdict(protocol), training_points_required=training,
-                          validation_points_required=scenarios))
-    report = dict(
-        scope="Synthetic implementation verification only; no full benchmark experiment.",
-        official_configuration=asdict(defaults),
-        protocol_table_T0_8=table,
-        smoke_overrides=dict(predictor_epochs=1, correction_epochs=1, score_epochs=1,
-                             checkpoint_epochs=[1], auxiliary_per_epoch=2,
-                             auxiliary_batch_size=2, validation_seeds=[1001], device=device),
-        cuda_available=torch.cuda.is_available(),
-        entities=[],
-    )
+    overrides = dict(predictor_epochs=1,corrector_linear_steps=3,corrector_nonlinear_steps=3,score_epochs=2,
+                     auxiliary_train_pairs=12,auxiliary_validation_pairs=48,device=device)
+    report = dict(implementation_version=IMPLEMENTATION_VERSION,
+                  scope="Synthetic implementation verification only; no complete benchmark or detection-quality claim.",
+                  official_configuration=asdict(Config()),smoke_overrides=overrides,
+                  cuda_available=torch.cuda.is_available(),entities=[])
     previous = None
-    for entity, length, seed, phase in [("synthetic_A", 5000, 3, 0), ("synthetic_B", 5500, 4, 1.5)]:
-        model = ASEI(**dict(report["smoke_overrides"], seed=seed))
-        model.detect_fit(normal_series(length, phase))
-        meta = model.metadata_
-        ar = {key: value for key, value in meta["corrector"]["ar_optimization"].items() if key != "trace"}
-        for calibration in meta["calibration"]:
-            assert calibration["false_alarm_count"] <= calibration["K"]
-            assert calibration["false_alarm_count"] == int(np.count_nonzero(model.validation_scores_ > calibration["threshold"]))
-        assert meta["corrector"]["maximum_beta_l1"] <= 0.95 + 1e-12
-        assert ar["converged"] == (ar["gradient_mapping_inf"] <= 1e-5)
-        assert len(meta["scoring_candidates"]) == 6
+    for name,length,seed in (("synthetic_A",4000,42),("synthetic_short",3604,43)):
+        model = ASEI(**overrides,seed=seed).detect_fit(normal_series(length,seed))
+        for record in model.metadata_["calibration"]:
+            assert record["false_alarm_count"]<=record["K"]
+            assert record["false_alarm_count"]==int((model.validation_scores_>record["threshold"]).sum())
+        assert model.metadata_["corrector"]["maximum_beta_l1"]<=.950001
+        assert model.metadata_["counters"]["score_epoch_feature_extractor_calls"]==0
+        test = normal_series(250,91)
+        whole = model.detect_score(test)[0]
+        model.reset_state()
+        streamed = np.concatenate([model.detect_stream(test.iloc[a:b])[1] for a,b in ((0,31),(31,90),(90,91),(91,250))])
+        np.testing.assert_allclose(whole,streamed,atol=1e-5,rtol=1e-5)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/"asei.pt"
+            model.save(path)
+            restored = ASEI.load(path,device=device)
+            np.testing.assert_array_equal(restored.detect_score(test)[0],whole)
         if previous is not None:
-            assert not np.shares_memory(previous.reference.errors, model.reference.errors)
-            assert previous.corrector.mlp[0].weight.data_ptr() != model.corrector.mlp[0].weight.data_ptr()
-        report["entities"].append(dict(
-            entity=entity, points=length, seed=seed, actual_configuration=asdict(model.config),
-            data_sha256=meta["data_sha256"], splits=meta["splits"], protocol=meta["auxiliary_protocol"],
-            protocol_feasibility=meta["protocol_feasibility"], reference_points=meta["reference_points"],
-            calibration=meta["calibration"], linear_ar=ar,
-            execution_device=str(model.device), reference_warmup=meta["reference_warmup"],
-            score_warmup=meta["score_warmup"], validation_evidence_builds=meta["validation_evidence_builds"],
-            validation_cache_resident_bytes=meta["validation_cache_resident_bytes"],
-            maximum_beta_l1=meta["corrector"]["maximum_beta_l1"],
-            scoring_candidates=meta["scoring_candidates"], selection=meta["selection"],
-            saved_scoring_checkpoints=meta["saved_scoring_checkpoints"], versions=meta["versions"],
-        ))
+            assert not np.shares_memory(previous.reference.errors,model.reference.errors)
+            assert previous.corrector is not model.corrector and previous.scorer is not model.scorer
+        summary = {key:value for key,value in model.metadata_.items() if key not in ("training_tasks","validation_tasks")}
+        for key in ("training_tasks","validation_tasks"):
+            tasks = model.metadata_[key]
+            summary[key] = dict(count=len(tasks),sha256=hashlib.sha256(json.dumps(tasks,sort_keys=True).encode()).hexdigest(),
+                                examples=tasks[:1])
+        report["entities"].append(dict(entity=name,points=length,actual_configuration=asdict(model.config),
+                                       metadata=summary,streaming_matches=True,reload_matches=True))
+        print(json.dumps(dict(entity=name,calibration=model.metadata_["calibration"],
+                              corrector=model.metadata_["corrector"],counters=model.metadata_["counters"])),flush=True)
         previous = model
-        print(json.dumps(dict(entity=entity, s=model.protocol_.s, calibration=meta["calibration"],
-                              ar_converged=ar["converged"], ar_iterations=ar["iterations"],
-                              ar_mapping_inf=ar["gradient_mapping_inf"]), ensure_ascii=False), flush=True)
-    report["recurrence_correctness_and_timing"] = check_recurrence(previous.device, 8, 256)
+    report["recurrence_correctness_and_timing"] = check_recurrence(previous.device,8,1024)
+    report["unverified"] = ["Full datasets, benchmark scores and training convergence", "BF16 predictor training"]
+    if previous.device.type!="cuda":
+        report["unverified"].append("CUDA execution, GPU throughput and peak memory")
     output = Path(output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"Validation report: {output}")
+    output.parent.mkdir(parents=True,exist_ok=True)
+    output.write_text(json.dumps(report,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
+    print(f"Validation report: {output}",flush=True)
+    return report
 
 
-if __name__ == "__main__":
+if __name__=="__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", default="result/asei_validation/summary.json")
-    parser.add_argument("--device", default="auto", help="auto selects one CUDA device when available; otherwise CPU")
+    parser.add_argument("--output",default="result/asei_validation/summary.json")
+    parser.add_argument("--device",default="auto")
     args = parser.parse_args()
-    validate(args.output, args.device)
+    validate(args.output,args.device)

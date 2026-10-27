@@ -9,11 +9,11 @@ if [[ "$mode" != "score" && "$mode" != "label" ]]; then
     exit 2
 fi
 
-seed="${ASEI_SEED:-0}"
+seed="${ASEI_SEED:-2026}"
 gpu="${ASEI_GPU:-1}"
 hyper_params="${ASEI_HYPER_PARAMS:-}"
 if [[ -z "$hyper_params" ]]; then
-    hyper_params='{"batch_size":128,"lr":0.001,"num_epochs":50,"win_size":63,"predictor_block_size":16,"alpha":0.01,"checkpoint_dir":"result/asei_checkpoints"}'
+    hyper_params="{\"device\":\"auto\",\"seed\":${seed},\"lr\":0.001,\"num_epochs\":20,\"win_size\":63,\"alpha\":0.01,\"checkpoint_dir\":\"result/asei_checkpoints\"}"
 fi
 
 # CUDA_VISIBLE_DEVICES is set by TAB before CUDA initialization:
