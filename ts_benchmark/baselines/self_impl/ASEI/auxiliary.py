@@ -1,6 +1,6 @@
 """Paired perturbations and event-balanced objectives from the ASEI specification."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -41,6 +41,15 @@ class Task:
     seed: int
     severity: float = None
     scenario: str = "train"
+    base_attempts: int = 0
+    hard: bool = False
+
+    def __post_init__(self):
+        self.events = [tuple(event) for event in self.events]
+
+
+class IneffectivePerturbation(ValueError):
+    pass
 
 
 class TaskSampler:
@@ -49,6 +58,9 @@ class TaskSampler:
         self.protocol = protocol or make_protocol(config, raw_history, scale, 1.0)
         self.lengths = self.protocol.training_lengths
         self.event_start = self.protocol.event_start
+        self._shift_masks = {}
+        self._candidate_cache = {}
+        self.hardness_prefix = None
 
     def _make(self, lengths, gaps, family, subtype, rng, severity=None, scenario="train"):
         cursor, events = self.event_start, []
@@ -80,11 +92,74 @@ class TaskSampler:
                               [0.3, 0.8, 1.5] if family == 1 else [1, 4, 16])
                 for severity_index, amplitude in enumerate(amplitudes):
                     for scenario, lengths, gaps in self.protocol.validation_layouts(severity_index):
-                        tasks.append(self._make(lengths, gaps, family, severity_index % 2,
-                                                rng, amplitude, scenario))
+                        task = self._make(lengths, gaps, family, severity_index % 2, rng, amplitude, scenario)
+                        tasks.append(self.resolve(task)[0])
         return tasks
 
     def materialize(self, task):
+        _, normal, changed = self.resolve(task)
+        return normal, changed
+
+    def _shift_mask(self, delay):
+        if delay not in self._shift_masks:
+            mask = np.zeros(len(self.values), dtype=bool)
+            for begin in range(delay, len(self.values), 8192):
+                end = min(len(self.values), begin + 8192)
+                mask[begin:end] = np.any(self.values[begin:end] != self.values[begin - delay:end - delay], axis=1)
+            self._shift_masks[delay] = mask
+        return self._shift_masks[delay]
+
+    def _candidate_starts(self, task):
+        key = (task.length, tuple((int(begin), int(end)) for begin, end in task.events), task.severity)
+        if key not in self._candidate_cache:
+            count = len(self.values) - task.length + 1
+            possible = np.ones(count, dtype=bool)
+            delays = [int(task.severity)] if task.severity is not None else [1, 2, 4, 8, 16]
+            changed = np.logical_or.reduce([self._shift_mask(delay) for delay in delays])
+            for begin, end in task.events:
+                possible &= changed[begin:begin + count]
+                possible &= changed[end - 1:end - 1 + count]
+            self._candidate_cache[key] = np.flatnonzero(possible)
+        return self._candidate_cache[key]
+
+    def resolve(self, task):
+        """Resample the base, preserving family, layout and a deterministic task-local RNG."""
+        try:
+            normal, changed = self._materialize_fixed(task)
+            return task, normal, changed
+        except IneffectivePerturbation:
+            pass
+        candidates = (self._candidate_starts(task) if task.family == 2
+                      else np.arange(len(self.values) - task.length + 1))
+        candidates = candidates[candidates != task.start]
+        if not len(candidates):
+            raise IneffectivePerturbation(
+                f"No effective auxiliary base trajectory: family={task.family}, scenario={task.scenario}, "
+                "no eligible start changes every event's first and last observation"
+            )
+        rng = np.random.default_rng(np.random.SeedSequence([task.seed, 104729]))
+        attempts = self.config.perturbation_base_attempts
+        if task.hard and self.hardness_prefix is not None:
+            pool = rng.choice(candidates, min(len(candidates), 4 * attempts), replace=False)
+            prefix = self.hardness_prefix
+            difficulty = ((prefix[pool + task.length] - prefix[pool + self.raw_history])
+                          / (task.length - self.raw_history))
+            candidates = pool[np.argsort(-difficulty, kind="stable")[:max(1, int(np.ceil(len(pool) / 4)))]]
+        order = rng.choice(candidates, min(attempts, len(candidates)), replace=False)
+        for index, start in enumerate(order, 1):
+            resolved = replace(task, start=int(start), seed=int(rng.integers(2 ** 31)),
+                               base_attempts=task.base_attempts + index)
+            try:
+                normal, changed = self._materialize_fixed(resolved)
+                return resolved, normal, changed
+            except IneffectivePerturbation:
+                continue
+        raise IneffectivePerturbation(
+            f"Cannot create an effective auxiliary perturbation after {len(order)} new base trajectories; "
+            f"family={task.family}, scenario={task.scenario}. No invalid task is used."
+        )
+
+    def _materialize_fixed(self, task):
         normal = self.values[task.start:task.start + task.length].copy()
         rng = np.random.default_rng(task.seed)
         for _ in range(32):
@@ -131,7 +206,7 @@ class TaskSampler:
                 return normal, changed
             if task.family == 2 and not np.any(np.ptp(normal, axis=0) > 0):
                 break
-        raise ValueError("Cannot create an effective perturbation; select a nonconstant normal trajectory")
+        raise IneffectivePerturbation("This base trajectory cannot produce an effective perturbation")
 
 
 def prepare_objective(task, raw_history, rank_pairs, rng):
@@ -178,3 +253,8 @@ def objective(scores, logits, metadata, margin=1, rank_temperature=1):
     detection = (0.5 * torch.stack(positive_losses).sum() / event_count
                  + 0.5 * torch.stack(negative_losses).sum() / torch.stack(negative_weights).sum())
     return detection, torch.cat(ranking).mean()
+
+
+def objective_to_device(metadata, device):
+    return [{key: torch.as_tensor(value, device=device) if isinstance(value, np.ndarray) else value
+             for key, value in item.items()} for item in metadata]

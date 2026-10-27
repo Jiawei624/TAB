@@ -191,23 +191,24 @@ def R_AUC_PR(actual: np.ndarray, predicted: np.ndarray, **kwargs):
 
 
 def VUS_ROC(actual: np.ndarray, predicted: np.ndarray, **kwargs):
-    slidingWindow = int(np.median(get_list_anomaly(actual)))
-    # slidingWindow = 100
-
-    _, _, _, _, _, _, VUS_ROC, VUS_PR = generate_curve(
-        actual, predicted, 2 * slidingWindow
-    )
-    return VUS_ROC
+    return _vus_pair(actual, predicted, kwargs)[0]
 
 
 def VUS_PR(actual: np.ndarray, predicted: np.ndarray, **kwargs):
-    slidingWindow = int(np.median(get_list_anomaly(actual)))
-    # slidingWindow = 100
+    return _vus_pair(actual, predicted, kwargs)[1]
 
-    _, _, _, _, _, _, VUS_ROC, VUS_PR = generate_curve(
-        actual, predicted, 2 * slidingWindow
-    )
-    return VUS_PR
+
+def _vus_pair(actual, predicted, kwargs):
+    slidingWindow = int(np.median(get_list_anomaly(actual)))
+    cache = kwargs.get("_evaluation_cache")
+    key = ("vus", 2 * slidingWindow)
+    if cache is not None and key in cache:
+        return cache[key]
+    *_, roc, pr = generate_curve(actual, predicted, 2 * slidingWindow)
+    result = (roc, pr)
+    if cache is not None:
+        cache[key] = result
+    return result
 
 
 # y_test = np.array([1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1])

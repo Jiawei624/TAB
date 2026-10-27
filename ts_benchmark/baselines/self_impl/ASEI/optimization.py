@@ -1,6 +1,7 @@
 """Float64 full-batch Huber AR optimization with projected backtracking."""
 
 import logging
+import math
 
 import torch
 from torch import nn
@@ -12,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 class LinearARObjective(nn.Module):
-    """Replica-local sums; reduction on the primary GPU produces full-batch gradients."""
+    """Full-batch sufficient sums on one device."""
     def __init__(self, corrector):
         super().__init__()
         self.bias, self.beta = corrector.bias, corrector.beta
@@ -57,7 +58,8 @@ def fit_projected_ar(objective, history, target, radius=0.95, max_iter=1000,
         if progress is not None:
             progress.phase(f"iteration={iteration} full_gradient")
         loss, grad_bias, grad_beta = statistics()
-        if not all(torch.isfinite(value).all().item() for value in (loss, grad_bias, grad_beta)):
+        finite = torch.stack((torch.isfinite(loss).all(), torch.isfinite(grad_bias).all(), torch.isfinite(grad_beta).all())).all()
+        if not finite.item():
             raise FloatingPointError("ASEI full-batch AR loss/gradient is not finite")
         loss_value = float(loss.item())
         if initial_loss is None:
@@ -76,9 +78,9 @@ def fit_projected_ar(objective, history, target, radius=0.95, max_iter=1000,
             module.bias.copy_(candidate_bias)
             module.beta.copy_(candidate_beta)
             candidate_loss = objective(history, target, gradients=False).sum() / normalizer
-            candidate_value, upper_bound = float(candidate_loss.item()), float(rhs.item())
+            candidate_value, upper_bound = torch.stack((candidate_loss, rhs)).cpu().tolist()
             slack = 32 * torch.finfo(torch.float64).eps * max(1.0, abs(loss_value), abs(upper_bound))
-            if (torch.isfinite(candidate_loss).item()
+            if (math.isfinite(candidate_value)
                     and candidate_value <= upper_bound + slack):
                 break
             step *= shrink
@@ -87,7 +89,7 @@ def fit_projected_ar(objective, history, target, radius=0.95, max_iter=1000,
                 module.bias.copy_(bias)
                 module.beta.copy_(beta)
                 raise FloatingPointError("ASEI projected AR backtracking failed to find a finite quadratic-upper-bound step")
-        mapping = max(float(diff_bias.abs().max().item()), float(diff_beta.abs().max().item())) / step
+        mapping = float(torch.maximum(diff_bias.abs().max(), diff_beta.abs().max()).item()) / step
         total_reductions += reductions
         trace.append(dict(iteration=iteration, loss=loss_value, candidate_loss=candidate_value,
                           quadratic_upper_bound=upper_bound, numerical_slack=slack,
@@ -106,8 +108,8 @@ def fit_projected_ar(objective, history, target, radius=0.95, max_iter=1000,
     # Report the mapping at the parameters actually returned, including capped runs.
     final_loss, grad_bias, grad_beta = statistics()
     candidate_bias, candidate_beta = proposal(module.bias, module.beta, grad_bias, grad_beta, step)
-    final_mapping = max(float((module.bias - candidate_bias).abs().max().item()),
-                        float((module.beta - candidate_beta).abs().max().item())) / step
+    final_mapping = float(torch.maximum((module.bias - candidate_bias).abs().max(),
+                                       (module.beta - candidate_beta).abs().max()).item()) / step
     converged = final_mapping <= tolerance
     return dict(optimizer="full_batch_projected_gradient", dtype="float64", huber_delta=1,
                 weight_decay=0, radius=radius, max_iter=max_iter, initial_step=initial_step,

@@ -1,6 +1,7 @@
 """Frozen empirical references and exact strict-exceedance thresholds."""
 
 import numpy as np
+import torch
 
 
 def error_history(errors, order):
@@ -34,10 +35,30 @@ class EvidenceReference:
         self.errors = np.sort(errors.astype(np.float64), axis=0)
         self.residuals = np.sort(residuals.astype(np.float64), axis=0)
         self.center = self._g(errors, residuals).mean(0)
+        self._tensor_device = None
         return self
 
     def transform(self, errors, residuals):
         return self._g(errors, residuals) - self.center
+
+    def to(self, device):
+        key = str(device)
+        if getattr(self, "_tensor_device", None) != key:
+            self._tensor_device = key
+            self._tensor_errors = torch.as_tensor(self.errors, device=device).permute(1, 2, 0).contiguous()
+            self._tensor_residuals = torch.as_tensor(self.residuals, device=device).permute(1, 2, 0).contiguous()
+            self._tensor_center = torch.as_tensor(self.center, device=device)
+        return self
+
+    def transform_tensor(self, errors, residuals):
+        self.to(errors.device)
+        perspectives = []
+        for values, reference in ((residuals, self._tensor_residuals), (errors, self._tensor_errors)):
+            query = values.to(torch.float64).permute(1, 2, 0).contiguous()
+            index = torch.searchsorted(reference, query, right=False)
+            probability = (len(self.errors) + 1 - index).to(torch.float64) / (len(self.errors) + 1)
+            perspectives.append((-torch.log(probability)).amax(1).clamp_max(self.bound).transpose(0, 1))
+        return torch.stack(perspectives, -1) - self._tensor_center
 
 
 def local_features(evidence, window):
@@ -48,6 +69,14 @@ def local_features(evidence, window):
                            np.cumsum(evidence, axis=0, dtype=np.float64)), axis=0)
     means = (sums[window:] - sums[:-window]) / window
     return np.concatenate((evidence[window - 1:], means), axis=-1).astype(np.float32)
+
+
+def local_features_tensor(evidence, window):
+    if len(evidence) < window:
+        return evidence.new_empty((0, evidence.shape[1], 4), dtype=torch.float32)
+    sums = torch.cat((torch.zeros_like(evidence[:1]), torch.cumsum(evidence, dim=0)), dim=0)
+    means = (sums[window:] - sums[:-window]) / window
+    return torch.cat((evidence[window - 1:], means), dim=-1).to(torch.float32)
 
 
 def empirical_threshold(scores, alpha):

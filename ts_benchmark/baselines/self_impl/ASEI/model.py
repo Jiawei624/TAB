@@ -6,10 +6,11 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
+from .recurrence import integrate
 
 
 def unwrap(module):
-    return module.module if isinstance(module, nn.DataParallel) else module
+    return module
 
 
 def cpu_state(module):
@@ -165,11 +166,12 @@ class ErrorCorrector(nn.Module):
 
 class EvidenceScorer(nn.Module):
     def __init__(self, bound, omega_min, lambda_min, lambda_max, lambda_init,
-                 kappa, temperature):
+                 kappa, temperature, recurrence_backend="scripted"):
         super().__init__()
         self.bound, self.omega_min = bound, omega_min
         self.lambda_min, self.lambda_max = lambda_min, lambda_max
         self.kappa, self.temperature = kappa, temperature
+        self.recurrence_backend = recurrence_backend
         self.gate_weight = nn.Parameter(torch.zeros(4))
         self.gate_bias = nn.Parameter(torch.zeros(()))
         probability = (lambda_init - lambda_min) / (lambda_max - lambda_min)
@@ -187,16 +189,10 @@ class EvidenceScorer(nn.Module):
         evidence = omega * features[..., 0] + (1 - omega) * features[..., 1]
         if state is None:
             state = evidence.new_zeros((evidence.shape[0], evidence.shape[2]))
-        scores = []
-        decay = self.decay
-        for current in evidence.unbind(1):
-            activation = decay * state + current - self.kappa
-            scores.append(torch.amax(activation, dim=-1))  # Split tie gradients equally.
-            state = F.relu(activation)
-        return torch.stack(scores, 1), state
+        return integrate(evidence, self.decay, state, self.kappa, self.recurrence_backend)
 
     def forward(self, paired_features):
-        # Keep each original/perturbed pair on the same DataParallel replica.
+        # Each original/perturbed pair shares one independently initialized state.
         batch, pair, length, channels, _ = paired_features.shape
         scores, _ = self.integrate(paired_features.reshape(batch * pair, length, channels, 4))
         scores = scores.reshape(batch, pair, length)

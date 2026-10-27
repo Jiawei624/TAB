@@ -20,8 +20,9 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 
-from .auxiliary import TaskSampler, characteristic_scale, objective, prepare_objective
-from .calibration import EvidenceReference, empirical_threshold, error_history, local_features
+from .auxiliary import TaskSampler, characteristic_scale, objective, objective_to_device, prepare_objective
+from .calibration import EvidenceReference, empirical_threshold, error_history, local_features, local_features_tensor
+from .cache import ValidationCache
 from .model import ErrorCorrector, EvidenceScorer, Predictor, cpu_state, lag_graph, temporal_layout, unwrap
 from .optimization import LinearARObjective, fit_projected_ar
 from .protocol import AuxiliaryProtocol, select_protocol
@@ -87,9 +88,10 @@ class Config:
     num_workers: int = 0
     seed: object = None
     device: str = "auto"
-    multi_gpu: bool = False
-    device_ids: tuple = (0, 1)  # Logical IDs after CUDA_VISIBLE_DEVICES.
     checkpoint_dir: object = None
+    perturbation_base_attempts: int = 128
+    validation_cache_mb: float = 256
+    recurrence_backend: str = "scripted"
 
 
 class WindowDataset(Dataset):
@@ -163,17 +165,11 @@ class ASEI:
         self.seed = int(torch.initial_seed() % (2 ** 32) if cfg.seed is None else cfg.seed)
         device = ("cuda:0" if torch.cuda.is_available() else "cpu") if cfg.device == "auto" else cfg.device
         self.device = torch.device(device)
-        self.device_ids = list(cfg.device_ids) if cfg.multi_gpu else []
-        if cfg.multi_gpu:
-            if (not torch.cuda.is_available() or len(self.device_ids) < 2
-                    or max(self.device_ids) >= torch.cuda.device_count() or self.device.type != "cuda"):
-                raise ValueError("ASEI multi_gpu=true requires at least two visible CUDA GPUs and valid logical device_ids")
-            self.device = torch.device(f"cuda:{self.device_ids[0]}")
-            for name in ["batch_size", "correction_batch_size", "auxiliary_batch_size"]:
-                if getattr(cfg, name) < len(self.device_ids):
-                    raise ValueError(f"{name} must be at least the number of training GPUs")
-            if cfg.batch_size // cfg.predictor_block_size < len(self.device_ids):
-                raise ValueError("batch_size / predictor_block_size must be at least the number of training GPUs")
+        if self.device.type == "cuda" and (not torch.cuda.is_available()
+                or (self.device.index or 0) >= torch.cuda.device_count()):
+            raise ValueError("Requested CUDA device is unavailable; use device='auto' for CPU fallback")
+        if self.device.type not in ("cuda", "cpu"):
+            raise ValueError("ASEI supports one CUDA device or CPU")
         self.scaler = StandardScaler()
         self._fitted = False
 
@@ -186,7 +182,7 @@ class ASEI:
                              "rolling_window", "predictor_epochs", "patience", "batch_size", "predictor_block_size", "ar_max_iter",
                              "correction_epochs", "correction_batch_size", "score_epochs", "auxiliary_per_epoch",
                              "auxiliary_batch_size", "normal_prefix", "recovery_suffix", "validation_gap",
-                             "hard_pool_size", "rank_pairs", "inference_chunk_size"]
+                             "hard_pool_size", "rank_pairs", "inference_chunk_size", "perturbation_base_attempts"]
         for name in positive_integers:
             value = getattr(cfg, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -227,10 +223,10 @@ class ASEI:
         if (not cfg.validation_seeds or any(not isinstance(seed, int) or seed < 0 for seed in cfg.validation_seeds)
                 or (cfg.seed is not None and (not isinstance(cfg.seed, int) or cfg.seed < 0))):
             raise ValueError("Seeds must be nonnegative integers")
-        if not isinstance(cfg.multi_gpu, bool):
-            raise ValueError("multi_gpu must be a boolean")
-        if not cfg.device_ids or any(not isinstance(i, int) or i < 0 for i in cfg.device_ids) or len(set(cfg.device_ids)) != len(cfg.device_ids):
-            raise ValueError("device_ids must contain unique nonnegative logical GPU IDs")
+        if not np.isfinite(cfg.validation_cache_mb) or cfg.validation_cache_mb < 0:
+            raise ValueError("validation_cache_mb must be finite and nonnegative")
+        if cfg.recurrence_backend not in ("scripted", "reference"):
+            raise ValueError("recurrence_backend must be 'scripted' or 'reference'")
         ratios = cfg.anomaly_ratio
         alphas = cfg.alpha if isinstance(cfg.alpha, (tuple, list)) else [cfg.alpha]
         if ratios is not None:
@@ -248,9 +244,7 @@ class ASEI:
         return self.model_name
 
     def _wrap(self, module):
-        module = module.to(self.device)
-        return nn.DataParallel(module, device_ids=self.device_ids,
-                               output_device=self.device_ids[0]) if self.device_ids else module
+        return module.to(self.device)
 
     @staticmethod
     def _freeze(module):
@@ -314,7 +308,7 @@ class ASEI:
                 valid = batch[2] if len(batch) == 3 else None
                 points = int(valid.sum().item()) if valid is not None else len(history)
                 progress.phase(f"batch={step} transfer")
-                history, target = history.to(self.device), target.to(self.device)
+                history, target = history.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
                 if target.ndim == 2:
                     target = target[:, None]
                 if optimizer is not None:
@@ -327,13 +321,13 @@ class ASEI:
                 else:
                     losses = F.huber_loss(predicted, actual, delta=1, reduction="none").mean(dim=(-1, -2))
                     loss = (losses * valid.to(self.device)).sum() / points
-                self._finite(loss, "predictor loss")
+                value = self._loss_value(loss, "predictor loss")
                 if optimizer is not None:
                     progress.phase(f"batch={step} backward")
                     loss.backward()
                     progress.phase(f"batch={step} optimizer")
                     optimizer.step()
-                total += loss.item() * points
+                total += value * points
                 count += points
                 progress.update(step, f"mean_loss={total / count:.7f} target_points={count}")
                 progress.phase("data_loading")
@@ -343,6 +337,13 @@ class ASEI:
     def _finite(value, name):
         if not torch.isfinite(value).all().item():
             raise FloatingPointError(f"ASEI {name} is not finite")
+
+    @staticmethod
+    def _loss_value(value, name):
+        result = float(value.detach().item())
+        if not math.isfinite(result):
+            raise FloatingPointError(f"ASEI {name} is not finite")
+        return result
 
     def _fit_predictor(self, fit, validation):
         cfg = self.config
@@ -379,10 +380,11 @@ class ASEI:
                                        "graph_edges": int(mask.sum())}
 
     @torch.no_grad()
-    def _errors(self, values, progress_label=None):
+    def _error_tensor(self, values, progress_label=None):
         # Frozen sequence inference reuses causal convolution states within each chunk.
-        # The primary GPU processes continuous time; temporal state is never split across replicas.
+        # The selected device processes continuous time.
         predictor = unwrap(self.predictor)
+        values = torch.as_tensor(values, dtype=torch.float32, device=self.device)
         result = []
         chunks = math.ceil(max(0, len(values) - self.history) / self.config.inference_chunk_size)
         context = Progress(progress_label, chunks, self.config.log_interval_seconds) if progress_label else nullcontext()
@@ -391,16 +393,20 @@ class ASEI:
                 if progress:
                     progress.phase(f"chunk={step} prediction")
                 end = min(len(values), begin + self.config.inference_chunk_size)
-                inputs = torch.as_tensor(values[begin - self.history:end - 1],
-                                         dtype=torch.float32, device=self.device)[None]
+                inputs = values[begin - self.history:end - 1][None]
                 predicted = predictor(inputs, output_steps=end - begin)[0]
-                actual = torch.as_tensor(values[begin:end], dtype=torch.float32, device=self.device)
+                actual = values[begin:end]
                 error = (actual[..., None] - predicted).square()
-                self._finite(error, "prediction errors")
-                result.append(error.cpu().numpy())
+                result.append(error)
                 if progress:
                     progress.update(step)
-        return np.concatenate(result) if result else np.empty((0, len(self.columns_), 2), dtype=np.float32)
+        return torch.cat(result) if result else values.new_empty((0, len(self.columns_), 2))
+
+    @torch.no_grad()
+    def _errors(self, values, progress_label=None):
+        result = self._error_tensor(values, progress_label)
+        self._finite(result, "prediction errors")
+        return result.cpu().numpy()
 
     def _fit_corrector(self, values):
         cfg = self.config
@@ -418,14 +424,14 @@ class ASEI:
             corrector.eta.copy_(torch.from_numpy(0.1 * (np.percentile(errors, 75, axis=0)
                                                        - np.percentile(errors, 25, axis=0))))
         self.corrector = self._wrap(corrector)
-        # Full-batch float64 sufficient sums are reduced across DataParallel replicas.
-        # No optimizer update is made until every fitting sample has contributed.
+        # One full-batch float64 update includes every fitting sample.
         linear_objective = self._wrap(LinearARObjective(corrector))
+        resident_history = torch.as_tensor(history, dtype=torch.float64, device=self.device)
+        resident_target = torch.as_tensor(target, dtype=torch.float64, device=self.device)
         with Progress("linear_AR", cfg.ar_max_iter, cfg.log_interval_seconds) as progress:
             ar_status = fit_projected_ar(
                 linear_objective,
-                torch.as_tensor(history, dtype=torch.float64, device=self.device),
-                torch.as_tensor(target, dtype=torch.float64, device=self.device),
+                resident_history, resident_target,
                 radius=cfg.rho, max_iter=cfg.ar_max_iter, initial_step=cfg.ar_initial_step,
                 shrink=cfg.ar_backtracking_factor, tolerance=cfg.ar_tolerance, progress=progress,
             )
@@ -433,23 +439,24 @@ class ASEI:
         corrector.beta.requires_grad_(False)
         corrector.mlp.requires_grad_(True)
         del linear_objective
-        loader = self._loader(TensorDataset(torch.from_numpy(history), torch.from_numpy(target)),
-                              cfg.correction_batch_size, True)
+        resident_history = resident_history.to(torch.float32)
+        loader = self._loader(TensorDataset(torch.arange(len(target))), cfg.correction_batch_size, True)
         optimizer = torch.optim.AdamW(corrector.mlp.parameters(), lr=cfg.correction_learning_rate,
                                       weight_decay=cfg.weight_decay)
         for epoch in range(1, cfg.correction_epochs + 1):
             total, count = 0.0, 0
             self.corrector.train()
             with Progress(f"compensation epoch={epoch}", len(loader), cfg.log_interval_seconds) as progress:
-                for step, (previous, current) in enumerate(loader, 1):
+                for step, (indices,) in enumerate(loader, 1):
                     progress.phase(f"batch={step} forward_backward")
-                    previous, current = previous.to(self.device), current.to(self.device, dtype=torch.float64)
+                    indices = indices.to(self.device, non_blocking=True)
+                    previous, current = resident_history[indices], resident_target[indices]
                     optimizer.zero_grad(set_to_none=True)
                     loss = F.huber_loss(self.corrector(previous), current, delta=1)
-                    self._finite(loss, "correction loss")
+                    value = self._loss_value(loss, "correction loss")
                     loss.backward()
                     optimizer.step()
-                    total += loss.item() * len(previous)
+                    total += value * len(previous)
                     count += len(previous)
                     progress.update(step, f"mean_loss={total / count:.7f}")
             if epoch == cfg.correction_epochs or epoch == 1 or epoch % 10 == 0:
@@ -463,39 +470,62 @@ class ASEI:
                     self.metadata_["corrector"]["maximum_beta_l1"])
 
     @torch.no_grad()
-    def _residuals(self, errors):
-        history = error_history(errors, self.config.ar_order)
+    def _residual_tensor(self, errors):
+        errors = torch.as_tensor(errors, device=self.device)
+        order = self.config.ar_order
+        history = errors.unfold(0, order + 1, 1)[..., :order].flip(-1).contiguous()
         residuals = []
         for begin in range(0, len(history), self.config.correction_batch_size):
-            previous = torch.as_tensor(history[begin:begin + self.config.correction_batch_size], device=self.device)
+            previous = history[begin:begin + self.config.correction_batch_size]
             predicted = unwrap(self.corrector)(previous)
-            residuals.append(predicted.cpu().numpy())
-        return errors[self.config.ar_order:] - np.concatenate(residuals)
+            residuals.append(predicted)
+        return errors[order:].to(torch.float64) - torch.cat(residuals)
+
+    @torch.no_grad()
+    def _residuals(self, errors):
+        return self._residual_tensor(errors).cpu().numpy()
 
     def _features(self, values):
+        return self._feature_tensor(values).cpu().numpy()
+
+    @torch.no_grad()
+    def _feature_tensor(self, values):
         if len(values) <= self.raw_history:
-            return np.empty((0, len(self.columns_), 4), dtype=np.float32)
+            return torch.empty((0, len(self.columns_), 4), dtype=torch.float32, device=self.device)
+        errors = self._error_tensor(values)
+        residuals = self._residual_tensor(errors)
+        self._finite(errors, "prediction errors")
+        self._finite(residuals, "corrected residuals")
+        evidence = self.reference.transform_tensor(errors[self.config.ar_order:], residuals)
+        return local_features_tensor(evidence, self.config.rolling_window)
+
+    def _features_reference(self, values):
         errors = self._errors(values)
         residuals = self._residuals(errors)
-        evidence = self.reference.transform(errors[self.config.ar_order:], residuals)
-        return local_features(evidence, self.config.rolling_window)
+        return local_features(self.reference.transform(errors[self.config.ar_order:], residuals), self.config.rolling_window)
 
     def _feature_chunks(self, values):
         """Bound frozen feature memory independently of the full sequence length."""
         for begin in range(self.raw_history, len(values), self.config.inference_chunk_size):
             end = min(len(values), begin + self.config.inference_chunk_size)
-            yield self._features(values[begin - self.raw_history:end])
+            yield self._feature_tensor(values[begin - self.raw_history:end])
 
     def _new_scorer(self, kappa):
         cfg = self.config
         protocol = self.protocol_
         return EvidenceScorer(cfg.evidence_bound, cfg.omega_min, protocol.lambda_min,
-                              protocol.lambda_max, protocol.lambda_init, kappa, cfg.classification_temperature)
+                              protocol.lambda_max, protocol.lambda_init, kappa, cfg.classification_temperature,
+                              recurrence_backend=cfg.recurrence_backend)
 
     def _fit_reference(self, reference):
-        errors = self._errors(reference, "independent reference prediction errors")
-        residuals = self._residuals(errors)
-        self.reference = EvidenceReference(self.config.evidence_bound).fit(errors[self.config.ar_order:], residuals)
+        if len(reference) <= self.history + self.config.ar_order:
+            raise ValueError("Independent reference fragment has no valid d/r sample after prediction and AR warmup")
+        errors = self._error_tensor(reference, "independent reference prediction errors")
+        residuals = self._residual_tensor(errors)
+        self._finite(errors, "reference errors")
+        self._finite(residuals, "reference residuals")
+        self.reference = EvidenceReference(self.config.evidence_bound).fit(
+            errors[self.config.ar_order:].cpu().numpy(), residuals.cpu().numpy()).to(self.device)
 
     @torch.no_grad()
     def _calibrate(self, validation):
@@ -521,15 +551,15 @@ class ASEI:
     def _batch(self, tasks, sampler):
         arrays, metadata = [], []
         for task in tasks:
-            normal, changed = sampler.materialize(task)
-            arrays.append(np.stack((self._features(normal), self._features(changed))))
+            task, normal, changed = sampler.resolve(task)
+            arrays.append(torch.stack((self._feature_tensor(normal), self._feature_tensor(changed))))
             metadata.append(prepare_objective(task, self.raw_history, self.config.rank_pairs,
                                               np.random.default_rng(task.seed + 11)))
         longest = max(array.shape[1] for array in arrays)
-        features = np.zeros((len(arrays), 2, longest, len(self.columns_), 4), dtype=np.float32)
+        features = torch.zeros((len(arrays), 2, longest, len(self.columns_), 4), dtype=torch.float32, device=self.device)
         for index, array in enumerate(arrays):
             features[index, :, :array.shape[1]] = array
-        return torch.as_tensor(features, device=self.device), metadata
+        return features, objective_to_device(metadata, self.device)
 
     def _loss(self, candidate, features, metadata):
         scores, logits = candidate(features)
@@ -537,12 +567,12 @@ class ASEI:
                          self.config.ranking_temperature)
 
     @torch.no_grad()
-    def _validate_scorers(self, candidates, sampler, tasks):
+    def _validate_scorers(self, candidates, sampler, tasks, cache=None):
         grouped = [{} for _ in candidates]
         with Progress("scoring validation", len(tasks), self.config.log_interval_seconds) as progress:
             for task_index, task in enumerate(tasks):
                 progress.phase(f"task={task_index + 1} evidence")
-                features, metadata = self._batch([task], sampler)
+                features, metadata = cache.get(task_index) if cache is not None else self._batch([task], sampler)
                 for candidate_index, candidate in enumerate(candidates):
                     progress.phase(f"task={task_index + 1} candidate={candidate_index + 1}/{len(candidates)}")
                     candidate["model"].eval()
@@ -563,7 +593,9 @@ class ASEI:
         cfg = self.config
         sampler = TaskSampler(fit, self.raw_history, scale, cfg, self.protocol_)
         valid_sampler = TaskSampler(validation, self.raw_history, scale, cfg, self.protocol_)
-        valid_tasks = valid_sampler.validation()  # Fail before optimizing if the protocol cannot fit.
+        valid_tasks = getattr(self, "validation_tasks_", None)
+        if valid_tasks is None:
+            valid_tasks = valid_sampler.validation()
         # All configurations share each newly generated paired batch, avoiding a large evidence cache.
         candidates = []
         for kappa in cfg.kappa_values:
@@ -577,16 +609,35 @@ class ASEI:
         with Progress("hard-normal evidence", chunks, cfg.log_interval_seconds) as progress:
             for step, features in enumerate(self._feature_chunks(fit), 1):
                 progress.phase(f"chunk={step} evidence")
-                state_g = features[..., 1].astype(np.float64) + self.reference.center[None, :, 1]
-                state_means.append(state_g.mean(1))
+                current = torch.as_tensor(features, device=self.device).to(torch.float64)
+                center = torch.as_tensor(self.reference.center[:, 1], device=self.device)
+                state_means.append((current[..., 1] + center).mean(1).cpu().numpy())
                 progress.update(step)
         hardness = np.r_[np.zeros(self.raw_history), np.concatenate(state_means)]
         hardness_sum = np.r_[0.0, hardness.cumsum()]
+        sampler.hardness_prefix = hardness_sum
         del state_means
         best = None
         best_key = (float("inf"), float("inf"), float("inf"))
         selection_log = []
         self.scoring_checkpoints_ = {}
+        cache = ValidationCache(self.device, cfg.validation_cache_mb)
+        try:
+            with Progress("fixed validation evidence cache", len(valid_tasks), cfg.log_interval_seconds) as progress:
+                for index, task in enumerate(valid_tasks):
+                    cache.append(*self._batch([task], valid_sampler))
+                    progress.update(index + 1)
+            self.metadata_["validation_evidence_builds"] = len(cache.entries)
+            self.metadata_["validation_cache_resident_bytes"] = cache.used
+            self.metadata_["validation_cache_spilled_entries"] = sum(isinstance(item[0], Path) for item in cache.entries)
+            self._optimize_scorers(candidates, sampler, valid_sampler, valid_tasks, cache,
+                                   hardness_sum, best_key, best, selection_log)
+        finally:
+            cache.close()
+
+    def _optimize_scorers(self, candidates, sampler, valid_sampler, valid_tasks, cache,
+                          hardness_sum, best_key, best, selection_log):
+        cfg = self.config
         for epoch in range(1, cfg.score_epochs + 1):
             rng = np.random.default_rng(np.random.SeedSequence([self.seed, 7919, epoch]))
             tasks = []
@@ -600,6 +651,7 @@ class ASEI:
                         return (hardness_sum[item.start + item.length] - hardness_sum[begin]) / (item.length - self.raw_history)
                     pool.sort(key=difficulty, reverse=True)
                     task = pool[int(rng.integers(max(1, int(np.ceil(len(pool) / 4)))))]
+                    task.hard = True
                 tasks.append(task)
             batches = math.ceil(len(tasks) / cfg.auxiliary_batch_size)
             with Progress(f"scoring epoch={epoch}", batches, cfg.log_interval_seconds) as progress:
@@ -613,7 +665,7 @@ class ASEI:
                         optimizer.zero_grad(set_to_none=True)
                         detection, ranking = self._loss(model, features, metadata)
                         loss = detection + candidate["gamma"] * ranking
-                        self._finite(loss, "scoring objective")
+                        self._loss_value(loss, "scoring objective")
                         loss.backward()
                         nn.utils.clip_grad_norm_(model.parameters(), 1)
                         optimizer.step()
@@ -621,7 +673,7 @@ class ASEI:
                     progress.update(step)
             logger.info("ASEI scoring epoch=%d/%d candidates=%d", epoch, cfg.score_epochs, len(candidates))
             if epoch in cfg.checkpoint_epochs:
-                losses = self._validate_scorers(candidates, valid_sampler, valid_tasks)
+                losses = self._validate_scorers(candidates, valid_sampler, valid_tasks, cache)
                 selection_log.append(dict(epoch=epoch, losses=losses,
                                           groups=copy.deepcopy(getattr(self, "_last_validation_groups_", []))))
                 self.scoring_checkpoints_[epoch] = []
@@ -650,10 +702,12 @@ class ASEI:
     def detect_fit(self, train_data, train_label=None, valid_data=None):
         """Labels are not used. valid_data optionally supplies an external normal split."""
         self._fitted = False
+        self.validation_tasks_ = None
         cfg = self.config
         torch.manual_seed(self.seed)
         if self.device.type == "cuda":
-            torch.cuda.manual_seed_all(self.seed)
+            with torch.cuda.device(self.device):
+                torch.cuda.manual_seed(self.seed)
         values = self._values(train_data, fitting=True)
         if valid_data is None:
             boundary = int(len(values) * 0.8)
@@ -665,7 +719,7 @@ class ASEI:
         fit, correction, reference = training[:first], training[first:second], training[second:]
         for name, part, minimum in [("predictor", fit, self.history + 1),
                                      ("corrector", correction, self.history + cfg.ar_order + 1),
-                                     ("reference", reference, self.raw_history + 1),
+                                     ("reference", reference, self.history + cfg.ar_order + 1),
                                      ("validation", validation, self.raw_history + 1)]:
             if len(part) < minimum:
                 raise ValueError(f"ASEI {name} split has {len(part)} points; requires at least {minimum}. "
@@ -677,6 +731,7 @@ class ASEI:
         # Only deterministic normal lengths and T0 participate; no seed or validation loss.
         self.protocol_, protocol_trials = select_protocol(cfg, self.raw_history, scale, len(fit), len(validation))
         validation_tasks = TaskSampler(validation, self.raw_history, scale, cfg, self.protocol_).validation()
+        self.validation_tasks_ = validation_tasks
         signature = hashlib.sha256()
         signature.update(repr((values.shape, self.columns_)).encode("utf-8"))
         digest_inputs = [values]
@@ -696,13 +751,16 @@ class ASEI:
             predictor_learning_rate=cfg.learning_rate, predictor_max_epochs=cfg.predictor_epochs,
             auxiliary_protocol=asdict(self.protocol_), protocol_feasibility=protocol_trials,
             reference_points=len(reference) - self.history - cfg.ar_order,
+            reference_warmup=self.history + cfg.ar_order,
+            reference_first_observation=self.history + cfg.ar_order + 1,
+            score_warmup=self.raw_history,
             validation_task_count=len(validation_tasks), device=str(self.device),
-            data_parallel=bool(self.device_ids), logical_device_ids=self.device_ids,
+            execution="single_device",
             versions={"python": platform.python_version(), "numpy": np.__version__,
                       "torch": torch.__version__, "pandas": pd.__version__, "sklearn": sklearn.__version__},
         )
-        logger.info("ASEI device=%s logical_gpu_ids=%s W=%d raw_history=%d splits=%s T0=%d s=%g",
-                    self.device, self.device_ids, self.receptive_field, self.raw_history,
+        logger.info("ASEI device=%s W=%d raw_history=%d splits=%s T0=%d s=%g",
+                    self.device, self.receptive_field, self.raw_history,
                     self.metadata_["splits"], scale, self.protocol_.s)
         logger.info("ASEI predictor batch_size=%d lr=%g max_epochs=%d; compensation_epochs=%d scoring_epochs=%d",
                     cfg.batch_size, cfg.learning_rate, cfg.predictor_epochs,
@@ -748,7 +806,7 @@ class ASEI:
             end = min(len(values), begin + self.config.inference_chunk_size)
             previous = len(self._raw_cache)
             joined = np.concatenate((self._raw_cache, values[begin:end]))
-            features = self._features(joined)
+            features = self._feature_tensor(joined)
             first_ready = begin + min(end - begin, max(0, self.raw_history - previous))
             self.last_ready_mask_[first_ready:end] = True
             if len(features):
@@ -769,7 +827,7 @@ class ASEI:
         return self.detect_stream(test_data, reset=True)
 
     def save(self, path):
-        """Save a complete portable detector without DataParallel key prefixes."""
+        """Save a complete portable single-device detector."""
         if not self._fitted:
             raise RuntimeError("Cannot save an unfitted ASEI detector")
         payload = dict(format_version=2, config=asdict(self.config), columns=self.columns_, seed=self.seed,
@@ -788,11 +846,12 @@ class ASEI:
         torch.save(payload, path)
 
     @classmethod
-    def load(cls, path, device="auto", multi_gpu=False):
+    def load(cls, path, device="auto"):
         payload = torch.load(path, map_location="cpu", weights_only=False)
         if payload.get("format_version") != 2:
             raise ValueError("Unsupported ASEI checkpoint format")
-        config = dict(payload["config"], device=device, multi_gpu=multi_gpu)
+        config = {key: value for key, value in payload["config"].items() if key not in ("multi_gpu", "device_ids")}
+        config["device"] = device
         detector = cls(**config)
         detector.columns_, detector.seed = payload["columns"], payload["seed"]
         detector.protocol_ = AuxiliaryProtocol(**payload["protocol"])

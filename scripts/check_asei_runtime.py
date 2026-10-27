@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 import time
+import statistics
 
 import numpy as np
 import torch
@@ -14,13 +15,44 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ts_benchmark.baselines.self_impl import ASEI
-from ts_benchmark.baselines.self_impl.ASEI.model import Predictor, lag_graph
+from ts_benchmark.baselines.self_impl.ASEI.model import EvidenceScorer, Predictor, lag_graph
 from ts_benchmark.baselines.self_impl.ASEI.progress import IMPLEMENTATION_VERSION, Progress
+
+
+def check_recurrence(device, channels, steps):
+    torch.manual_seed(17)
+    features = torch.randn(2, 2, steps, channels, 4, device=device)
+    records, outputs, gradients = [], [], []
+    for backend in ("reference", "scripted"):
+        model = EvidenceScorer(6, 0.05, 0.8, 0.98, 0.9, 0.02, 0.25, backend).to(device)
+        timings = []
+        for iteration in range(4):
+            model.zero_grad(set_to_none=True)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            started = time.perf_counter()
+            scores, logits = model(features)
+            (scores.square().mean() + logits.square().mean()).backward()
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            if iteration:
+                timings.append(time.perf_counter() - started)
+        outputs.append(scores.detach().cpu())
+        gradients.append([parameter.grad.detach().cpu().clone() for parameter in model.parameters()])
+        records.append(dict(backend=backend, median_forward_backward_seconds=statistics.median(timings)))
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=1e-5, atol=1e-5)
+    for expected, actual in zip(*gradients):
+        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
+    result = dict(check="recurrence", device=str(device), steps=steps, channels=channels,
+                  output_max_abs_error=float((outputs[0] - outputs[1]).abs().max()),
+                  gradient_max_abs_error=max(float((a - b).abs().max()) for a, b in zip(*gradients)), timings=records)
+    print(json.dumps(result), flush=True)
+    return result
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--gpus", type=int, nargs="+", default=[1, 0])
+    parser.add_argument("--gpus", type=int, nargs=1, default=[1])
     parser.add_argument("--device", choices=["auto", "cpu"], default="auto")
     parser.add_argument("--channels", type=int, default=51)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -29,8 +61,9 @@ def main():
     parser.add_argument("--block-sizes", type=int, nargs="+", default=[1, 16])
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--log-interval", type=float, default=10)
+    parser.add_argument("--score-steps", type=int, default=256)
     args = parser.parse_args()
-    if min(args.channels, args.batch_size, args.win_size, args.batches, args.threads, *args.block_sizes) < 1:
+    if min(args.channels, args.batch_size, args.win_size, args.batches, args.threads, args.score_steps, *args.block_sizes) < 1:
         parser.error("Sizes and counts must be positive")
     if not args.gpus or min(args.gpus) < 0 or len(set(args.gpus)) != len(args.gpus):
         parser.error("--gpus must contain unique nonnegative IDs")
@@ -44,8 +77,7 @@ def main():
         with Progress(f"runtime setup block_size={block_size}", interval=args.log_interval):
             torch.manual_seed(0)
             use_cuda = args.device != "cpu" and torch.cuda.is_available()
-            detector = ASEI(device=args.device, multi_gpu=use_cuda and len(args.gpus) > 1,
-                            device_ids=list(range(len(args.gpus))), batch_size=args.batch_size,
+            detector = ASEI(device=args.device, batch_size=args.batch_size,
                             win_size=args.win_size, predictor_block_size=block_size,
                             log_interval_seconds=args.log_interval)
             length = detector.history + args.batch_size * args.batches
@@ -61,7 +93,7 @@ def main():
                                           weight_decay=cfg.weight_decay)
             if use_cuda:
                 logging.info("ASEI diagnostic GPU names=%s",
-                             [torch.cuda.get_device_name(index) for index in detector.device_ids or [0]])
+                             [torch.cuda.get_device_name(0)])
         if use_cuda:
             torch.cuda.synchronize(detector.device)
         started = time.monotonic()
@@ -74,9 +106,11 @@ def main():
                       W=detector.win_size, batches=len(loader), seconds=elapsed,
                       target_points_per_second=(length - detector.history) / elapsed, loss=loss)
         if use_cuda:
-            result["visible_gpus"] = [torch.cuda.get_device_name(index) for index in detector.device_ids or [0]]
+            result["visible_gpus"] = [torch.cuda.get_device_name(0)]
         print(json.dumps(result), flush=True)
         del loader, optimizer, detector
+    device = torch.device("cuda:0" if args.device != "cpu" and torch.cuda.is_available() else "cpu")
+    check_recurrence(device, args.channels, args.score_steps)
 
 
 if __name__ == "__main__":

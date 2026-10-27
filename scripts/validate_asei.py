@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ts_benchmark.baselines.self_impl import ASEI
 from ts_benchmark.baselines.self_impl.ASEI.asei import Config
 from ts_benchmark.baselines.self_impl.ASEI.protocol import PROTOCOL_SCALES, make_protocol
+from check_asei_runtime import check_recurrence
 
 
 def normal_series(length, phase=0):
@@ -23,7 +24,7 @@ def normal_series(length, phase=0):
                          "b": np.cos(time / 11) + 0.2 * np.sin(time / 7)})
 
 
-def validate(output):
+def validate(output, device="auto"):
     torch.set_num_threads(2)
     defaults = Config()
     table = []
@@ -38,7 +39,8 @@ def validate(output):
         protocol_table_T0_8=table,
         smoke_overrides=dict(predictor_epochs=1, correction_epochs=1, score_epochs=1,
                              checkpoint_epochs=[1], auxiliary_per_epoch=2,
-                             auxiliary_batch_size=2, validation_seeds=[1001], device="cpu"),
+                             auxiliary_batch_size=2, validation_seeds=[1001], device=device),
+        cuda_available=torch.cuda.is_available(),
         entities=[],
     )
     previous = None
@@ -61,6 +63,9 @@ def validate(output):
             data_sha256=meta["data_sha256"], splits=meta["splits"], protocol=meta["auxiliary_protocol"],
             protocol_feasibility=meta["protocol_feasibility"], reference_points=meta["reference_points"],
             calibration=meta["calibration"], linear_ar=ar,
+            execution_device=str(model.device), reference_warmup=meta["reference_warmup"],
+            score_warmup=meta["score_warmup"], validation_evidence_builds=meta["validation_evidence_builds"],
+            validation_cache_resident_bytes=meta["validation_cache_resident_bytes"],
             maximum_beta_l1=meta["corrector"]["maximum_beta_l1"],
             scoring_candidates=meta["scoring_candidates"], selection=meta["selection"],
             saved_scoring_checkpoints=meta["saved_scoring_checkpoints"], versions=meta["versions"],
@@ -69,6 +74,7 @@ def validate(output):
         print(json.dumps(dict(entity=entity, s=model.protocol_.s, calibration=meta["calibration"],
                               ar_converged=ar["converged"], ar_iterations=ar["iterations"],
                               ar_mapping_inf=ar["gradient_mapping_inf"]), ensure_ascii=False), flush=True)
+    report["recurrence_correctness_and_timing"] = check_recurrence(previous.device, 8, 256)
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -78,4 +84,6 @@ def validate(output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", default="result/asei_validation/summary.json")
-    validate(parser.parse_args().output)
+    parser.add_argument("--device", default="auto", help="auto selects one CUDA device when available; otherwise CPU")
+    args = parser.parse_args()
+    validate(args.output, args.device)

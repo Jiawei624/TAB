@@ -226,7 +226,7 @@ class ProtocolAndARTests(unittest.TestCase):
             self.assertAlmostEqual(protocol.lambda_init, 0.9 ** (1 / factor))
             self.assertEqual(len(set(protocol.training_lengths)), len(protocol.training_lengths))
             self.assertEqual(len(set(protocol.short_lengths)), len(protocol.short_lengths))
-            sampler = TaskSampler(np.zeros((max(required.values()), 2)), 89, 8, cfg, protocol)
+            sampler = TaskSampler(data(max(required.values())).values, 89, 8, cfg, protocol)
             tasks = sampler.validation()
             self.assertEqual(len(tasks), 72)
             self.assertEqual(set(task.scenario for task in tasks), {"short", "long", "dense", "paired"})
@@ -481,10 +481,12 @@ class FitTests(unittest.TestCase):
             ASEI(**dict(SMALL, normal_prefix=6400), device="cpu").detect_fit(data())
         with self.assertRaisesRegex(ValueError, "columns"):
             self.detector.detect_score(data(10)[["b", "a"]])
-        with patch.object(torch.cuda, "is_available", return_value=False), self.assertRaisesRegex(ValueError, "two visible"):
+        with patch.object(torch.cuda, "is_available", return_value=False):
+            self.assertEqual(ASEI(**SMALL).device.type, "cpu")
+        with self.assertRaisesRegex(ValueError, "Unknown ASEI hyperparameters"):
             ASEI(**SMALL, multi_gpu=True)
-        with self.assertRaisesRegex(ValueError, "reference split has"):
-            ASEI(device="cpu").detect_fit(data(1075))
+        with self.assertRaisesRegex(ValueError, "corrector split has"):
+            ASEI(device="cpu").detect_fit(data(1000))
 
     def test_tab_file_training_all_metrics_records_and_csv(self):
         from ts_benchmark.data.data_pool import DataPool
@@ -535,68 +537,31 @@ class FitTests(unittest.TestCase):
             DataPool().pool = previous_pool
 
 
-@unittest.skipUnless(torch.cuda.is_available() and torch.cuda.device_count() >= 2,
-                     "Requires two CUDA GPUs; execute on the server")
-class TwoGpuTests(unittest.TestCase):
-    def test_corrector_and_scorer_parallel_gradients(self):
-        corrector = ErrorCorrector(2, 2, 0.95)
-        corrector.eta.fill_(0.1)
-        nn.init.normal_(corrector.mlp[-1].weight, std=0.1)
-        scorer = EvidenceScorer(6, 0.05, 0.8, 0.98, 0.9, 0.02, 0.25)
-        for module, inputs in [(corrector, torch.rand(5, 2, 2, 2, device="cuda:0")),
-                               (scorer, torch.randn(5, 2, 8, 2, 4, device="cuda:0"))]:
-            single = module.cuda(0)
-            parallel = nn.DataParallel(copy.deepcopy(single), [0, 1])
-            first, second = single(inputs), parallel(inputs)
-            first = first if isinstance(first, tuple) else (first,)
-            second = second if isinstance(second, tuple) else (second,)
-            for actual, expected in zip(first, second):
-                torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
-            sum(value.square().mean() for value in first).backward()
-            sum(value.square().mean() for value in second).backward()
-            for actual, expected in zip(single.parameters(), parallel.module.parameters()):
-                if actual.grad is not None:
-                    torch.testing.assert_close(actual.grad, expected.grad, rtol=1e-3, atol=1e-4)
-
-    def test_full_batch_ar_reductions_match_on_two_gpus(self):
-        module = ErrorCorrector(2, 2, 0.95).cuda(0)
-        single = LinearARObjective(module)
-        parallel = nn.DataParallel(copy.deepcopy(single), [0, 1])
-        history = torch.rand(5, 2, 2, 2, dtype=torch.float64, device="cuda:0")
-        target = torch.rand(5, 2, 2, dtype=torch.float64, device="cuda:0")
-        for gradients in [False, True]:
-            first, second = single(history, target, gradients), parallel(history, target, gradients)
-            first = first if isinstance(first, tuple) else (first,)
-            second = second if isinstance(second, tuple) else (second,)
-            for actual, expected in zip(first, second):
-                torch.testing.assert_close(actual.sum(0), expected.sum(0), rtol=1e-12, atol=1e-12)
-
-    def test_uneven_batches_forward_gradients_and_real_fit(self):
-        graph = lag_graph(data(40).values, [1, 2], 1)
-        single = Predictor(2, *graph, hidden=4, embedding=2, dilations=[1]).cuda(0)
-        parallel = nn.DataParallel(Predictor(2, *graph, hidden=4, embedding=2, dilations=[1]).cuda(0), [0, 1])
-        parallel.module.load_state_dict(single.state_dict())
-        inputs = torch.randn(5, 4, 2, device="cuda:0")
-        target = torch.randn(5, 1, 2, 2, device="cuda:0")
-        outputs = [model(inputs) for model in [single, parallel]]
-        torch.testing.assert_close(*outputs, rtol=1e-4, atol=1e-5)
-        for output in outputs:
-            torch.nn.functional.huber_loss(output, target).backward()
-        for first, second in zip(single.parameters(), parallel.module.parameters()):
-            if first.grad is not None:
-                torch.testing.assert_close(first.grad, second.grad, rtol=1e-3, atol=1e-4)
-        detector = ASEI(**dict(SMALL, predictor_block_size=16), multi_gpu=True)
-        detector.detect_fit(data())
-        self.assertIsInstance(detector.predictor, nn.DataParallel)
-        self.assertIsInstance(detector.corrector, nn.DataParallel)
+@unittest.skipUnless(torch.cuda.is_available(), "Requires one CUDA GPU; execute on the server")
+class SingleGpuTests(unittest.TestCase):
+    def test_single_device_fit_tail_checkpoint_and_equivalent_recurrence(self):
+        detector = ASEI(**dict(SMALL, predictor_block_size=16), device="cuda:0").detect_fit(data())
+        self.assertEqual({parameter.device.index for module in [detector.predictor, detector.corrector, detector.scorer]
+                          for parameter in module.parameters()}, {0})
+        self.assertIsInstance(detector.predictor, Predictor)
         labels, scores = detector.detect_label(data(35))
         self.assertTrue(np.isfinite(scores).all())
         self.assertTrue(all(len(value) == 35 for value in labels.values()))
+        values = detector.scaler.transform(data(150).values).astype(np.float32)
+        np.testing.assert_allclose(detector._features(values), detector._features_reference(values), rtol=1e-5, atol=1e-5)
+        features = torch.randn(2, 2, 50, 2, 4, device="cuda:0")
+        optimized = copy.deepcopy(detector.scorer).requires_grad_(True)
+        reference = copy.deepcopy(optimized)
+        reference.recurrence_backend = "reference"
+        for model in [optimized, reference]:
+            outputs = model(features)
+            sum(value.square().mean() for value in outputs).backward()
+        for actual, expected in zip(optimized.parameters(), reference.parameters()):
+            torch.testing.assert_close(actual.grad, expected.grad, rtol=1e-4, atol=1e-5)
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "parallel.pt"
+            path = Path(directory) / "single.pt"
             detector.save(path)
             restored = ASEI.load(path, device="cpu")
-            self.assertEqual(restored.device.type, "cpu")
             self.assertEqual(detector.thresholds_, restored.thresholds_)
             self.assertTrue(np.isfinite(restored.detect_score(data(35))[0]).all())
 

@@ -1,6 +1,9 @@
 {
   "scope": "Synthetic implementation verification only; no full benchmark experiment.",
   "official_configuration": {
+    "lr": null,
+    "num_epochs": null,
+    "win_size": null,
     "hidden_dim": 32,
     "embedding_dim": 8,
     "kernel_size": 3,
@@ -41,6 +44,8 @@
     "predictor_epochs": 50,
     "patience": 5,
     "batch_size": 128,
+    "predictor_block_size": 1,
+    "log_interval_seconds": 30,
     "learning_rate": 0.001,
     "ar_max_iter": 1000,
     "ar_initial_step": 0.01,
@@ -79,12 +84,10 @@
     "num_workers": 0,
     "seed": null,
     "device": "auto",
-    "multi_gpu": false,
-    "device_ids": [
-      0,
-      1
-    ],
-    "checkpoint_dir": null
+    "checkpoint_dir": null,
+    "perturbation_base_attempts": 128,
+    "validation_cache_mb": 256,
+    "recurrence_backend": "scripted"
   },
   "protocol_table_T0_8": [
     {
@@ -271,12 +274,16 @@
     ],
     "device": "cpu"
   },
+  "cuda_available": false,
   "entities": [
     {
       "entity": "synthetic_A",
       "points": 5000,
       "seed": 3,
       "actual_configuration": {
+        "lr": null,
+        "num_epochs": null,
+        "win_size": null,
         "hidden_dim": 32,
         "embedding_dim": 8,
         "kernel_size": 3,
@@ -317,6 +324,8 @@
         "predictor_epochs": 1,
         "patience": 5,
         "batch_size": 128,
+        "predictor_block_size": 1,
+        "log_interval_seconds": 30,
         "learning_rate": 0.001,
         "ar_max_iter": 1000,
         "ar_initial_step": 0.01,
@@ -349,12 +358,10 @@
         "num_workers": 0,
         "seed": 3,
         "device": "cpu",
-        "multi_gpu": false,
-        "device_ids": [
-          0,
-          1
-        ],
-        "checkpoint_dir": null
+        "checkpoint_dir": null,
+        "perturbation_base_attempts": 128,
+        "validation_cache_mb": 256,
+        "recurrence_backend": "scripted"
       },
       "data_sha256": "e801004f9b89ed52d1a1473454b87894e8325871527cbb984589dcae62aa2517",
       "splits": {
@@ -474,6 +481,11 @@
         "last_step": 5.12,
         "backtracking_reductions": 990
       },
+      "execution_device": "cpu",
+      "reference_warmup": 82,
+      "score_warmup": 89,
+      "validation_evidence_builds": 36,
+      "validation_cache_resident_bytes": 1345152,
       "maximum_beta_l1": 0.9500000000000001,
       "scoring_candidates": [
         {
@@ -528,6 +540,9 @@
       "points": 5500,
       "seed": 4,
       "actual_configuration": {
+        "lr": null,
+        "num_epochs": null,
+        "win_size": null,
         "hidden_dim": 32,
         "embedding_dim": 8,
         "kernel_size": 3,
@@ -568,6 +583,8 @@
         "predictor_epochs": 1,
         "patience": 5,
         "batch_size": 128,
+        "predictor_block_size": 1,
+        "log_interval_seconds": 30,
         "learning_rate": 0.001,
         "ar_max_iter": 1000,
         "ar_initial_step": 0.01,
@@ -600,12 +617,10 @@
         "num_workers": 0,
         "seed": 4,
         "device": "cpu",
-        "multi_gpu": false,
-        "device_ids": [
-          0,
-          1
-        ],
-        "checkpoint_dir": null
+        "checkpoint_dir": null,
+        "perturbation_base_attempts": 128,
+        "validation_cache_mb": 256,
+        "recurrence_backend": "scripted"
       },
       "data_sha256": "a89c9d540a7d92511ab30a299430d64a4738bd0e7902413bb39efe571a78ca49",
       "splits": {
@@ -725,6 +740,11 @@
         "last_step": 2.56,
         "backtracking_reductions": 991
       },
+      "execution_device": "cpu",
+      "reference_warmup": 82,
+      "score_warmup": 89,
+      "validation_evidence_builds": 36,
+      "validation_cache_resident_bytes": 1345152,
       "maximum_beta_l1": 0.9500000000000001,
       "scoring_candidates": [
         {
@@ -774,5 +794,23 @@
         "sklearn": "1.7.2"
       }
     }
-  ]
+  ],
+  "recurrence_correctness_and_timing": {
+    "check": "recurrence",
+    "device": "cpu",
+    "steps": 256,
+    "channels": 8,
+    "output_max_abs_error": 0.0,
+    "gradient_max_abs_error": 0.0,
+    "timings": [
+      {
+        "backend": "reference",
+        "median_forward_backward_seconds": 0.021999299991875887
+      },
+      {
+        "backend": "scripted",
+        "median_forward_backward_seconds": 0.012518999981693923
+      }
+    ]
+  }
 }

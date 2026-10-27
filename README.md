@@ -1,6 +1,6 @@
 # TAB: Unified Benchmarking of Time Series Anomaly Detection Methods
 
-ASEI integration: [training, two-GPU launch commands and evaluation protocol](docs/ASEI.md).
+ASEI integration: [single-GPU training, CPU fallback and evaluation protocol](docs/ASEI.md).
 
 [![PVLDB](https://img.shields.io/badge/PVLDB'25-TAB-orange)](https://arxiv.org/pdf/2403.20150.pdf)  [![Python](https://img.shields.io/badge/Python-3.8%2B-blue)](https://www.python.org/)  [![PyTorch](https://img.shields.io/badge/PyTorch-2.4.1-blue)](https://pytorch.org/)  ![Stars](https://img.shields.io/github/stars/decisionintelligence/TAB)  
 

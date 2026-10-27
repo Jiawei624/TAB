@@ -6,7 +6,7 @@ import time
 
 
 logger = logging.getLogger(__name__)
-IMPLEMENTATION_VERSION = "asei-progress-blocks-1"
+IMPLEMENTATION_VERSION = "asei-single-device-2"
 
 
 class Progress:

@@ -78,8 +78,9 @@ class Evaluator:
         else:
             hist_data_np = None
 
+        metric_kwargs = dict(kwargs, _evaluation_cache={})
         return [
-            m(actual, predicted, scaler=scaler, hist_data=hist_data_np, **kwargs)
+            m(actual, predicted, scaler=scaler, hist_data=hist_data_np, **metric_kwargs)
             for m in self.metric_funcs
         ]
 
@@ -102,10 +103,11 @@ class Evaluator:
         """
         evaluate_result = []
         log_info = ""
+        metric_kwargs = dict(kwargs, _evaluation_cache={})
         for metric_name, m in zip(self.metric_names, self.metric_funcs):
             try:
                 evaluate_result.append(
-                    m(actual, predicted, scaler=scaler, hist_data=hist_data, **kwargs)
+                    m(actual, predicted, scaler=scaler, hist_data=hist_data, **metric_kwargs)
                 )
             except Exception as e:
                 evaluate_result.append(np.nan)
