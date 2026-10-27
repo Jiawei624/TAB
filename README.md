@@ -94,6 +94,11 @@ is better) in both the evaluation records and default reports. See
 [ADD definition and usage](docs/add_metric.md) for the MODEM-compatible delay
 policy, configuration examples, and verification command.
 
+For AnomalyTransformer data parallel training on two GPUs, see
+[multi-GPU commands](docs/multi_gpu.md). The shared pipeline checks, validation
+coverage, and remaining evaluation protocol constraints are documented in
+[repository checks](docs/repository_audit.md).
+
 
 
 ## FAQ

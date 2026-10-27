@@ -260,6 +260,8 @@ class DatasetForTransformer:
 
 class SegLoader(object):
     def __init__(self, data, win_size, step, mode="train"):
+        if win_size < 1 or step < 1:
+            raise ValueError("win_size and step must be positive")
         self.mode = mode
         self.step = step
         self.win_size = win_size
@@ -271,13 +273,13 @@ class SegLoader(object):
         Number of images in the object dataset.
         """
         if self.mode == "train":
-            return (self.data.shape[0] - self.win_size) // self.step + 1
+            return max(0, (self.data.shape[0] - self.win_size) // self.step + 1)
         elif self.mode == "val":
-            return (self.data.shape[0] - self.win_size) // self.step + 1
+            return max(0, (self.data.shape[0] - self.win_size) // self.step + 1)
         elif self.mode == "test":
-            return (self.data.shape[0] - self.win_size) // self.step + 1
+            return max(0, (self.data.shape[0] - self.win_size) // self.step + 1)
         else:
-            return (self.data.shape[0] - self.win_size) // self.win_size + 1
+            return max(0, (self.data.shape[0] - self.win_size) // self.win_size + 1)
 
     def __getitem__(self, index):
         index = index * self.step
@@ -319,9 +321,13 @@ def anomaly_detection_data_provider(
     data, batch_size, win_size=100, step=100, mode="train"
 ):
     dataset = SegLoader(data, win_size, step, mode)
+    if len(dataset) == 0:
+        raise ValueError(
+            f"No complete windows: mode={mode}, length={len(data)}, win_size={win_size}"
+        )
 
     shuffle = False
-    if mode == "train" or mode == "val":
+    if mode == "train":
         shuffle = True
 
     data_loader = DataLoader(

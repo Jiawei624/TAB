@@ -15,6 +15,8 @@ class SequentialResult(TaskResult):
         self._result = None
 
     def result(self) -> Any:
+        if isinstance(self._result, Exception):
+            raise self._result
         return self._result
 
     def put(self, value: Any) -> NoReturn:
@@ -35,20 +37,29 @@ class SequentialSharedStorage(SharedStorage):
 
 class SequentialBackend:
 
-    def __init__(self, gpu_devices: Optional[List[int]] = None, **kwargs):
+    def __init__(self, gpu_devices: Optional[List[int]] = None, worker_initializers=None, **kwargs):
         super().__init__()
         self.gpu_devices = gpu_devices if gpu_devices is not None else []
         self.storage = None
+        self.worker_initializers = (
+            worker_initializers if isinstance(worker_initializers, list)
+            else [worker_initializers] if worker_initializers is not None else []
+        )
 
     def init(self) -> NoReturn:
         self.storage = SequentialSharedStorage()
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.gpu_devices))
+        for initializer in self.worker_initializers:
+            initializer(self.env)
 
     def schedule(self, fn: Callable, args: Tuple, timeout: float = -1) -> SequentialResult:
         if timeout != -1:
             warnings.warn("timeout is not supported by SequentialBackend, ignoring")
         res = SequentialResult()
-        res.put(fn(*args))
+        try:
+            res.put(fn(*args))
+        except Exception as error:
+            res.put(error)
         return res
 
     def close(self, force: bool = False):

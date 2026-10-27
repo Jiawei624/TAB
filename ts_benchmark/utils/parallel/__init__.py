@@ -3,7 +3,6 @@ from typing import Optional, List, Callable, Tuple, NoReturn, Union
 
 from ts_benchmark.utils.design_pattern import Singleton
 from ts_benchmark.utils.parallel.base import TaskResult, SharedStorage
-from ts_benchmark.utils.parallel.ray_backend import RayBackend
 from ts_benchmark.utils.parallel.sequential_backend import SequentialBackend
 
 
@@ -13,7 +12,7 @@ __all__ = ["ParallelBackend", "SharedStorage"]
 class ParallelBackend(metaclass=Singleton):
     #: all available backends
     BACKEND_DICT = {
-        "ray": RayBackend,
+        "ray": None,
         "sequential": SequentialBackend,
     }
 
@@ -35,7 +34,12 @@ class ParallelBackend(metaclass=Singleton):
             raise ValueError(f"Unknown backend name {backend}")
         if self.backend is not None:
             raise RuntimeError("Please close the backend before re-initializing")
-        self.backend = self.BACKEND_DICT[backend](
+        backend_class = self.BACKEND_DICT[backend]
+        if backend == "ray" and backend_class is None:
+            from ts_benchmark.utils.parallel.ray_backend import RayBackend
+
+            backend_class = RayBackend
+        self.backend = backend_class(
             n_workers=n_workers,
             n_cpus=n_cpus,
             gpu_devices=gpu_devices,

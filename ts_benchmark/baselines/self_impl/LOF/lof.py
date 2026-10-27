@@ -72,7 +72,7 @@ class LOF:
         :param X: The data of the score to be calculated.
         :return: Anomaly score array.
         """
-        X = X.values.reshape(-1, 1)
+        X = X.to_numpy()
 
         self.detector_ = LocalOutlierFactor(
             n_neighbors=self.n_neighbors,
@@ -93,7 +93,7 @@ class LOF:
             .fit_transform(self.decision_scores_.reshape(-1, 1))
             .ravel()
         )
-        return score
+        return score, score
 
     def detect_label(self, X: pd.DataFrame) -> np.ndarray:
         """
@@ -102,28 +102,9 @@ class LOF:
         :param X: The data to be tested.
         :return: Anomaly label array.
         """
-        X = X.values.reshape(-1, 1)
-
-        self.detector_ = LocalOutlierFactor(
-            n_neighbors=self.n_neighbors,
-            algorithm=self.algorithm,
-            leaf_size=self.leaf_size,
-            metric=self.metric,
-            p=self.p,
-            metric_params=self.metric_params,
-            contamination=self.contamination,
-            n_jobs=self.n_jobs,
-        )
-        self.detector_.fit(X=X)
-
-        self.decision_scores_ = -self.detector_.negative_outlier_factor_
-
-        score = (
-            MinMaxScaler(feature_range=(0, 1))
-            .fit_transform(self.decision_scores_.reshape(-1, 1))
-            .ravel()
-        )
-        return score
+        score, _ = self.detect_score(X)
+        labels = (self.detector_.negative_outlier_factor_ < self.detector_.offset_).astype(int)
+        return labels, score
 
     def __repr__(self) -> str:
         """

@@ -115,7 +115,7 @@ def adjust_predicts(actual: np.ndarray, predicted: np.ndarray, **kwargs) -> np.n
 def adjust_precision(actual: np.ndarray, predicted: np.ndarray, **kwargs):
     predicted = adjust_predicts(actual, predicted)
     Precision, Recall, F, Support = metrics.precision_recall_fscore_support(
-        actual, predicted, zero_division=0
+        actual, predicted, labels=[0, 1], zero_division=0
     )
     return Precision[1]
 
@@ -123,7 +123,7 @@ def adjust_precision(actual: np.ndarray, predicted: np.ndarray, **kwargs):
 def adjust_recall(actual: np.ndarray, predicted: np.ndarray, **kwargs):
     predicted = adjust_predicts(actual, predicted)
     Precision, Recall, F, Support = metrics.precision_recall_fscore_support(
-        actual, predicted, zero_division=0
+        actual, predicted, labels=[0, 1], zero_division=0
     )
     return Recall[1]
 
@@ -131,7 +131,7 @@ def adjust_recall(actual: np.ndarray, predicted: np.ndarray, **kwargs):
 def adjust_f_score(actual: np.ndarray, predicted: np.ndarray, **kwargs):
     predicted = adjust_predicts(actual, predicted)
     Precision, Recall, F, Support = metrics.precision_recall_fscore_support(
-        actual, predicted, zero_division=0
+        actual, predicted, labels=[0, 1], zero_division=0
     )
     return F[1]
 
@@ -144,21 +144,21 @@ def adjust_accuracy(actual: np.ndarray, predicted: np.ndarray, **kwargs):
 
 def precision(actual: np.ndarray, predicted: np.ndarray, **kwargs):
     Precision, Recall, F, Support = metrics.precision_recall_fscore_support(
-        actual, predicted, zero_division=0
+        actual, predicted, labels=[0, 1], zero_division=0
     )
     return Precision[1]
 
 
 def recall(actual: np.ndarray, predicted: np.ndarray, **kwargs):
     Precision, Recall, F, Support = metrics.precision_recall_fscore_support(
-        actual, predicted, zero_division=0
+        actual, predicted, labels=[0, 1], zero_division=0
     )
     return Recall[1]
 
 
 def f_score(actual: np.ndarray, predicted: np.ndarray, **kwargs):
     Precision, Recall, F, Support = metrics.precision_recall_fscore_support(
-        actual, predicted, zero_division=0
+        actual, predicted, labels=[0, 1], zero_division=0
     )
     return F[1]
 
@@ -234,35 +234,39 @@ def precision_at_k(actual: np.ndarray, predicted: np.ndarray, **kwargs):
 def affiliation_f(actual: np.ndarray, predicted: np.ndarray, **kwargs):
     events_pred = convert_vector_to_events(predicted)
     events_label = convert_vector_to_events(actual)
+    if not events_label:
+        return float("nan")
+    if not events_pred:
+        return 0.0
     Trange = (0, len(predicted))
 
     result = pr_from_events(events_pred, events_label, Trange)
     P = result['precision']
     R = result['recall']
-    F = 2 * P * R / (P + R)
+    F = 2 * P * R / (P + R) if P + R else 0.0
 
     return F
 def affiliation_precision(actual: np.ndarray, predicted: np.ndarray, **kwargs):
     events_pred = convert_vector_to_events(predicted)
     events_label = convert_vector_to_events(actual)
+    if not events_label:
+        return float("nan")
     Trange = (0, len(predicted))
 
     result = pr_from_events(events_pred, events_label, Trange)
     P = result['precision']
-    R = result['recall']
-    F = 2 * P * R / (P + R)
 
     return P
 
 def affiliation_recall(actual: np.ndarray, predicted: np.ndarray, **kwargs):
     events_pred = convert_vector_to_events(predicted)
     events_label = convert_vector_to_events(actual)
+    if not events_label:
+        return float("nan")
     Trange = (0, len(predicted))
 
     result = pr_from_events(events_pred, events_label, Trange)
-    P = result['precision']
     R = result['recall']
-    F = 2 * P * R / (P + R)
 
     return R
 

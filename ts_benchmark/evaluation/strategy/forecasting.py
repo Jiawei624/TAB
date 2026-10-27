@@ -50,10 +50,10 @@ class ForecastingStrategy(Strategy, metaclass=abc.ABCMeta):
         except Exception as e:
             log = f"{traceback.format_exc()}\n{e}"
             single_series_results = self.get_default_result(
-                **{FieldNames.LOG_INFO: log}
+                **{FieldNames.FILE_NAME: series_name, FieldNames.LOG_INFO: log}
             )
 
-        return single_series_results
+        return [single_series_results]
 
     @abc.abstractmethod
     def _execute(

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import importlib
 import logging
+from types import ModuleType
 from typing import Any, Union, Dict, Callable, List
 
 from ts_benchmark.baselines import ADAPTER
@@ -18,7 +19,12 @@ def _import_attribute(attr_path: str) -> Any:
     """
     package_name, name = attr_path.rsplit(".", 1)
     package = importlib.import_module(package_name)
-    return getattr(package, name, None)
+    attribute = getattr(package, name)
+    # Importing a helper below self_impl.LOF (and similarly named packages)
+    # may install that subpackage on the parent before the model is selected.
+    if isinstance(attribute, ModuleType) and name in getattr(package, "_MODELS", {}):
+        attribute = package.__getattr__(name)
+    return attribute
 
 
 # 检查模型信息的类型
@@ -100,16 +106,24 @@ def get_model_info(model_config: Dict) -> Union[Dict, Callable]:
     model_name_candidates = list(filter(None, model_name_candidates))
 
     model_info = None
+    last_error = None
     for model_name in model_name_candidates:
         try:
             logger.info("Trying to load model %s", model_name)
             model_info = import_model_info(model_name)
         except (ImportError, AttributeError) as e:
+            last_error = e
             logger.info("Loading model %s failed", model_name)
             logger.info(f"Error: {e}")
             continue
         else:
             break
+
+    if model_info is None:
+        raise ImportError(
+            f"Cannot load model {model_config['model_name']!r}; "
+            f"check the model path and its dependencies. Last error: {last_error}"
+        ) from last_error
 
     adapter_name = model_config.get("adapter")
     if adapter_name is not None:

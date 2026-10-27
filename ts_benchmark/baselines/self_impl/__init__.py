@@ -1,40 +1,36 @@
-__all__ = [
-    "VAR_model",
-    "LOF",
-    "DCdetector",
-    "AnomalyTransformer",
-    "ModernTCN",
-    "DualTF",
-    "TFAD",
-    "TranAD",
-    "MatrixProfile",
-    "LeftSTAMPi",
-    "KMeans",
-    "DWT_MLEAD",
-    "SAND",
-    "Torsk",
-    "EIF",
-    "ContraAD",
-    "CATCH",
-    "CrossAD",
-]
+"""Load only the selected baseline and its optional dependencies."""
 
-from ts_benchmark.baselines.self_impl.LOF.lof import LOF
-from ts_benchmark.baselines.self_impl.VAR.VAR import VAR_model
-from ts_benchmark.baselines.self_impl.DCdetector.DCdetector import DCdetector
-from ts_benchmark.baselines.self_impl.Anomaly_trans.AnomalyTransformer import AnomalyTransformer
-from ts_benchmark.baselines.self_impl.ModernTCN.ModernTCN import ModernTCN
-from ts_benchmark.baselines.self_impl.DualTF.DualTF import DualTF
-from ts_benchmark.baselines.self_impl.TFAD.TFAD import TFAD
-from ts_benchmark.baselines.self_impl.MatrixProfile.MatrixProfile import MatrixProfile
-from ts_benchmark.baselines.self_impl.TranAD.TranAD import TranAD
-from ts_benchmark.baselines.self_impl.LeftSTAMPi.LeftSTAMPi import LeftSTAMPi
-from ts_benchmark.baselines.self_impl.KMeans.KMeans import KMeans
-from ts_benchmark.baselines.self_impl.DWT_MLEAD.DWTMLEAD import DWT_MLEAD
-from ts_benchmark.baselines.self_impl.SAND.SAND import SAND
-from ts_benchmark.baselines.self_impl.torsk.torsk import Torsk
-from ts_benchmark.baselines.self_impl.eif.eif import EIF
-from ts_benchmark.baselines.self_impl.ContraAD.ContraAD import ContraAD
-from ts_benchmark.baselines.self_impl.Series2Graph.Series2Graph import Series2Graph
-from ts_benchmark.baselines.self_impl.CATCH.CATCH import CATCH
-from ts_benchmark.baselines.self_impl.CrossAD.CrossAD import CrossAD
+from importlib import import_module
+
+
+_MODELS = {
+    "VAR_model": "VAR.VAR",
+    "LOF": "LOF.lof",
+    "DCdetector": "DCdetector.DCdetector",
+    "AnomalyTransformer": "Anomaly_trans.AnomalyTransformer",
+    "ModernTCN": "ModernTCN.ModernTCN",
+    "DualTF": "DualTF.DualTF",
+    "TFAD": "TFAD.TFAD",
+    "TranAD": "TranAD.TranAD",
+    "MatrixProfile": "MatrixProfile.MatrixProfile",
+    "LeftSTAMPi": "LeftSTAMPi.LeftSTAMPi",
+    "KMeans": "KMeans.KMeans",
+    "DWT_MLEAD": "DWT_MLEAD.DWTMLEAD",
+    "SAND": "SAND.SAND",
+    "Torsk": "torsk.torsk",
+    "EIF": "eif.eif",
+    "ContraAD": "ContraAD.ContraAD",
+    "Series2Graph": "Series2Graph.Series2Graph",
+    "CATCH": "CATCH.CATCH",
+    "CrossAD": "CrossAD.CrossAD",
+}
+
+__all__ = list(_MODELS)
+
+
+def __getattr__(name):
+    if name not in _MODELS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    model = getattr(import_module(f"{__name__}.{_MODELS[name]}"), name)
+    globals()[name] = model
+    return model

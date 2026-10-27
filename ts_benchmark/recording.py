@@ -109,7 +109,9 @@ def load_record_data(
         except (FileNotFoundError, PermissionError, KeyError, ParserError):
             # TODO: it is ugly to identify log files by artifact columns...
             logger.info("unrecognized log file format, skipping %s...", fn)
-    return pd.concat(ret, axis=0)
+    if not ret:
+        raise ValueError("No readable benchmark record files found")
+    return pd.concat(ret, axis=0, ignore_index=True)
 
 
 def find_record_files(directory: str) -> List[str]:

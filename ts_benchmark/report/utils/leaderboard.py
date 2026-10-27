@@ -49,17 +49,32 @@ def _calculate_single_metric_result(
     :return: The leaderboard values for a single metric.
     """
     metric_df = full_metric_df.copy()
+    metric_df[metric_name] = metric_df[metric_name].replace([np.inf, -np.inf], np.nan)
     metric_df["model_and_params"] = (
         metric_df["model_name"] + ";" + metric_df["model_params"]
     )
-    # todo:inf,-inf应该变成null
+    all_series = metric_df["file_name"].dropna().unique()
+    # Ratios represent distinct operating points. Do not silently average
+    # sensitivity/false-alarm trade-offs into one model's reported result.
+    ratio_column = "typical_anomaly_ratio"
+    if ratio_column in metric_df:
+        ratios = metric_df[ratio_column].map(
+            lambda value: f"{value:g}" if isinstance(value, (float, int, np.number))
+            and pd.notna(value) else str(value) if pd.notna(value) else None
+        )
+        multiple = ratios.groupby(metric_df["model_and_params"]).transform("nunique") > 1
+        metric_df.loc[multiple & ratios.notna(), "model_and_params"] += (
+            ";anomaly_ratio=" + ratios[multiple & ratios.notna()]
+        )
+        metric_df = metric_df.loc[~multiple | ratios.notna()]
+    all_models = metric_df["model_and_params"].unique()
     metric_df = metric_df[[metric_name, "model_and_params", "file_name"]].pivot_table(
         values=metric_name,
         index="file_name",
         columns="model_and_params",
-        aggfunc=np.nanmean,
+        aggfunc="mean",
         dropna=False,
-    )
+    ).reindex(index=all_series, columns=all_models)
     threshold_count = float(nan_threshold) * len(metric_df)
     nan_count = metric_df.isna().sum(axis=0)
     metric_values = _fill_null_value(metric_df, fill_type).aggregate(agg_type, axis=0)
@@ -99,6 +114,8 @@ def _get_report_metrics(
         else:
             # metric prefix, use prefix match
             matching_matrix.append(log_metric_prefix == metric)
+    if not matching_matrix:
+        return np.array([], dtype=object)
     matching_matrix = np.stack(matching_matrix, axis=0)
     not_matching = ~matching_matrix.any(axis=1)
     if not_matching.any():
@@ -138,10 +155,16 @@ def get_leaderboard(
     """
     if isinstance(report_metrics, str):
         report_metrics = [report_metrics]
+    if log_data.empty:
+        raise ValueError("No evaluation records to report")
+    if not 0 <= float(nan_threshold) <= 1:
+        raise ValueError("null_value_threshold must be between 0 and 1")
 
     actual_report_metrics = _get_report_metrics(
         log_data.columns.values, np.array(report_metrics)
     )
+    if not len(actual_report_metrics):
+        raise ValueError("None of the requested report metrics exist in the evaluation records")
 
     final_result = []
     for metric_name in actual_report_metrics:

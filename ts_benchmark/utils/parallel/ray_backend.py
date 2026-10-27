@@ -38,15 +38,16 @@ class RayActor:
     def run(self, fn: Callable, args: Tuple) -> Any:
         self._start_time = time.time()
         self._idle = False
-        res = fn(*args)
-        self._idle = True
-        return res
+        try:
+            return fn(*args)
+        finally:
+            self._idle = True
 
     def start_time(self) -> Optional[float]:
         return None if self._idle or self._start_time is None else self._start_time
 
 
-@ray.remote(max_restarts=-1)
+@ray.remote(max_restarts=-1, num_cpus=0)
 class ObjectRefStorageActor:
     def __init__(self):
         self.storage = {}
@@ -198,6 +199,10 @@ class RayActorPool:
                 del self._task_info[task_id]
                 del self._ray_task_to_id[task_obj]
                 continue
+            except Exception as error:
+                # A user task exception must reach the collector. Otherwise a
+                # RayTaskError kills this thread and result() waits forever.
+                task_info.result.put(error)
 
             self._actor_tasks[task_info.actor_id] += 1
             if (
@@ -344,12 +349,14 @@ class RayBackend:
     ):
         self.n_cpus = n_cpus if n_cpus is not None else os.cpu_count()
         self.n_workers = n_workers if n_workers is not None else self.n_cpus
+        if self.n_cpus < 1 or self.n_workers < 1:
+            raise ValueError("n_cpus and n_workers must be positive")
         self.gpu_devices = gpu_devices if gpu_devices is not None else []
         self.max_tasks_per_child = max_tasks_per_child
         self.worker_initializers = (
             worker_initializers
             if isinstance(worker_initializers, list)
-            else [worker_initializers]
+            else [worker_initializers] if worker_initializers is not None else []
         )
         self.pool = None
         self._storage = None
@@ -456,7 +463,7 @@ class RayBackend:
         tasks = []
         for actor in self.pool.actors:
             tasks.append(actor.run.remote(func, (self.env,)))
-        ray.wait(tasks, num_returns=len(tasks))
+        ray.get(tasks)
 
 
 if __name__ == "__main__":

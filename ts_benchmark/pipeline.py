@@ -49,7 +49,7 @@ def filter_data(
     :return:
     """
     # 删除值为 None 的过滤条件
-    feature_dict = {k: v for k, v in feature_dict.items() if v is not None}
+    feature_dict = {k: v for k, v in (feature_dict or {}).items() if v is not None}
 
     # 组合所有条件
     filt_metadata = metadata
@@ -106,9 +106,9 @@ def pipeline(
     """
     # 确定逻辑数据集
     # TODO: move these code into the data module, after the pipeline interface is unified
-    dataset_name_list = data_config.get("data_set_name", ["small_forecast"])
+    dataset_name_list = data_config.get("data_set_name", ["large_detect"])
     if not dataset_name_list:
-        dataset_name_list = ["small_forecast"]
+        dataset_name_list = ["large_detect"]
     if isinstance(dataset_name_list, str):
         dataset_name_list = [dataset_name_list]
     for dataset_name in dataset_name_list:
@@ -137,7 +137,9 @@ def pipeline(
                     data_src.dataset.metadata, size_value, feature_dict=feature_dict
                 )
             )
-    data_name_list = list(set(data_name_list))
+    if isinstance(data_name_list, str):
+        data_name_list = [data_name_list]
+    data_name_list = list(dict.fromkeys(data_name_list))
     if not data_name_list:
         raise ValueError("No dataset specified.")
     # 将数据载入内存

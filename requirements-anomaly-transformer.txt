@@ -1,0 +1,9 @@
+# Minimal dependencies for AnomalyTransformer with the sequential backend and CSV reports.
+# Select the appropriate CUDA build of torch on the server.
+numpy>=1.23.5,<2
+pandas>=1.5
+scipy
+scikit-learn
+statsmodels>=0.14.0
+torch>=1.11.0
+tqdm>=4.64.0

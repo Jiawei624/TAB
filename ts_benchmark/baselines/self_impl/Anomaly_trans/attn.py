@@ -35,14 +35,13 @@ class AnomalyAttention(nn.Module):
         self.mask_flag = mask_flag
         self.output_attention = output_attention
         self.dropout = nn.Dropout(attention_dropout)
-        window_size = win_size
-        # 时间距离矩阵
-        self.distances = torch.zeros((window_size, window_size)).cuda()
-        for i in range(window_size):
-            for j in range(window_size):
-                self.distances[i][j] = abs(i - j)
-        # self.distances = torch.abs(torch.arange(window_size).view(-1, 1) - torch.arange(window_size)).cuda()
-        # print("ok")
+        # Buffers follow .to(device) and DataParallel replicas. Keep old
+        # checkpoint keys compatible: this deterministic matrix is not saved.
+        positions = torch.arange(win_size, dtype=torch.float32)
+        self.register_buffer(
+            "distances", (positions[:, None] - positions[None, :]).abs(),
+            persistent=False,
+        )
 
     def forward(self, queries, keys, values, sigma, attn_mask):
         B, L, H, E = queries.shape
@@ -62,12 +61,7 @@ class AnomalyAttention(nn.Module):
         sigma = torch.sigmoid(sigma * 5) + 1e-5
         sigma = torch.pow(3, sigma) - 1
         sigma = sigma.unsqueeze(-1).repeat(1, 1, 1, window_size)  # B H L L
-        prior = (
-            self.distances.unsqueeze(0)
-            .unsqueeze(0)
-            .repeat(sigma.shape[0], sigma.shape[1], 1, 1)
-            .cuda()
-        )
+        prior = self.distances[None, None, :, :]
         # 将距离转换为高斯权重
         prior = (
             1.0

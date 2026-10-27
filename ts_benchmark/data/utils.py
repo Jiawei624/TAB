@@ -145,7 +145,7 @@ def is_st(data: pd.DataFrame) -> bool:
     :param data: The series data.
     :return: Are all values in 'cols' column are in spatial-temporal format.
     """
-    return data.shape[1] == 4
+    return {"date", "data", "cols", "id"}.issubset(data.columns)
 
 
 # 读取一个序列的协变量目录
@@ -218,61 +218,30 @@ def process_data_df(data: pd.DataFrame, nrows=None) -> pd.DataFrame:
     :param data: Data frame to read.
     :return:  The DataFrame of the content of the data file.
     """
-    label_exists = "label" in data["cols"].values
+    if not {"data", "cols"}.issubset(data.columns):
+        raise ValueError("TAB long-format CSV requires data and cols columns")
+    if data.empty or data["cols"].isna().any():
+        raise ValueError("TAB CSV must contain samples and non-null column names")
 
-    all_points = data.shape[0]
-
-    columns = data.columns
-
-    # 计算每个变量出现的最多次数
-    if columns[0] == "date":
-        n_points = data.iloc[:, 2].value_counts().max()
-    else:
-        n_points = data.iloc[:, 1].value_counts().max()
-
-    is_univariate = n_points == all_points
-
-    n_cols = all_points // n_points
-    df = pd.DataFrame()
-
-    cols_name = data["cols"].unique()
-
-    # 带data列并且是多变量
-    if columns[0] == "date" and not is_univariate:
-        df["date"] = data.iloc[:n_points, 0]
-        col_data = {
-            cols_name[j]: data.iloc[j * n_points : (j + 1) * n_points, 1].tolist()
-            for j in range(n_cols)
-        }
-        df = pd.concat([df, pd.DataFrame(col_data)], axis=1)
-        df["date"] = pd.to_datetime(df["date"])
-        df.set_index("date", inplace=True)
-
-    # 不带date列并且是多变量
-    elif columns[0] != "date" and not is_univariate:
-        col_data = {
-            cols_name[j]: data.iloc[j * n_points : (j + 1) * n_points, 0].tolist()
-            for j in range(n_cols)
-        }
-        df = pd.concat([df, pd.DataFrame(col_data)], axis=1)
-
-    # 带date列并且是单变量
-    elif columns[0] == "date" and is_univariate:
-        df["date"] = data.iloc[:, 0]
-        df[cols_name[0]] = data.iloc[:, 1]
-
-        df["date"] = pd.to_datetime(df["date"])
-        df.set_index("date", inplace=True)
-
-    # 不带date列并且是单变量
-    else:
-        df[cols_name[0]] = data.iloc[:, 0]
-
-    if label_exists:
-        # Get the column name of the last column
-        last_col_name = df.columns[-1]
-        # Renaming the last column as "label"
-        df.rename(columns={last_col_name: "label"}, inplace=True)
+    # Group by the actual column identifier rather than assuming contiguous
+    # blocks or assuming that the last block is the label. This also handles
+    # timestamp-major/interleaved CSV files without mixing features and labels.
+    col_data = {}
+    dates = None
+    n_points = None
+    for name, group in data.groupby("cols", sort=False, observed=True):
+        if n_points is None:
+            n_points = len(group)
+            if "date" in data.columns:
+                dates = group["date"].to_numpy()
+        if len(group) != n_points:
+            raise ValueError("All TAB CSV columns must contain the same number of samples")
+        if dates is not None and not np.array_equal(group["date"].to_numpy(), dates):
+            raise ValueError("TAB CSV columns must have the same timestamps in the same order")
+        col_data[name] = group["data"].to_numpy()
+    df = pd.DataFrame(col_data)
+    if dates is not None:
+        df.index = pd.DatetimeIndex(pd.to_datetime(dates), name="date")
 
     # 是否保留前nrows个时间点
     if nrows is not None and isinstance(nrows, int) and df.shape[0] >= nrows:
@@ -323,11 +292,18 @@ def load_series_info(file_path: str) -> dict:
         data = process_data_df(raw_data)
     else:
         data = process_data_np(raw_data)
-    if_univariate = data.shape[1] == 1
+    if_univariate = (
+        len(data.columns.drop("label", errors="ignore")) == 1
+        if isinstance(data, pd.DataFrame) else data.shape[1] == 1
+    )
     length = data.shape[0]
-    time_stamp = pd.to_datetime(raw_data.iloc[:length, 0])
-    freq = pd.infer_freq(time_stamp)
-    freq = FREQ_MAP.get(freq, "other")
+    freq = None
+    if "date" in raw_data.columns and length >= 3:
+        time_stamp = data.index if isinstance(data, pd.DataFrame) else pd.to_datetime(
+            raw_data["date"].drop_duplicates()
+        )
+        freq = pd.infer_freq(time_stamp)
+    freq = FREQ_MAP.get(freq.upper() if freq else "UNKNOWN", "other")
     file_name = os.path.basename(file_path)
     return {
         "file_name": file_name,

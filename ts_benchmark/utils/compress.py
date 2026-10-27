@@ -72,8 +72,7 @@ def decompress_gz(data: bytes) -> Dict[str, str]:
 
 def compress(data: Dict[str, str], method: str = "gz") -> bytes:
     if method != "gz":
-        compress_gzip(data)
-        # raise NotImplementedError("Only 'gz' method is supported by now")
+        raise NotImplementedError("Only 'gz' method is supported by now")
     return compress_gz(data)
 
 
@@ -86,8 +85,7 @@ def decompress(data: bytes, method: str = "gz") -> Dict[str, str]:
 
 def get_compress_file_ext(method: str) -> str:
     if method != "gz":
-        return "gzip"
-        # raise NotImplementedError("Only 'gz' method is supported by now")
+        raise NotImplementedError("Only 'gz' method is supported by now")
     return "tar.gz"
 
 

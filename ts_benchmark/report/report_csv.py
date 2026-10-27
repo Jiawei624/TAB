@@ -40,7 +40,9 @@ def report(report_config: dict) -> None:
     - None: The function does not return a value, but generates and saves a report to a CSV file.
     """
     log_files: Union[List[str], pd.DataFrame] = report_config.get("log_files_list")
-    if not log_files:
+    if log_files is None or (
+        log_files.empty if isinstance(log_files, pd.DataFrame) else not log_files
+    ):
         raise ValueError("No log files to report")
 
     log_data = (
@@ -58,19 +60,12 @@ def report(report_config: dict) -> None:
     )
 
     num_rows = leaderboard_df.shape[0]
-    leaderboard_df.insert(0, "strategy_args", [log_data.iloc[0, 1]] * num_rows)
+    leaderboard_df.insert(0, "strategy_args", [log_data["strategy_args"].iloc[0]] * num_rows)
 
     # Create final DataFrame and save to CSV
-    if report_config.get("save_path", None) is not None:
-        save_path = report_config.get("save_path", None)
-        leaderboard_df.to_csv(
-            os.path.join(
-                ROOT_PATH, "result", save_path, report_config["leaderboard_file_name"]
-            ),
-            index=False,
-        )
-    else:
-        leaderboard_df.to_csv(
-            os.path.join(ROOT_PATH, "result", report_config["leaderboard_file_name"]),
-            index=False,
-        )
+    save_path = report_config.get("save_path") or ""
+    directory = os.path.join(ROOT_PATH, "result", save_path)
+    os.makedirs(directory, exist_ok=True)
+    leaderboard_df.to_csv(
+        os.path.join(directory, report_config["leaderboard_file_name"]), index=False,
+    )

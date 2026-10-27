@@ -1,47 +1,38 @@
-# -*- coding: utf-8 -*-
-__all__ = [
-    "Autoformer",
-    "Crossformer",
-    "DLinear",
-    "ETSformer",
-    "FEDformer",
-    "FiLM",
-    "Informer",
-    "iTransformer",
-    "Koopa",
-    "LightTS",
-    "Linear",
-    "MICN",
-    "NLinear",
-    "Nonstationary_Transformer",
-    "PatchTST",
-    "Pyraformer",
-    "Reformer",
-    "TimesNet",
-    "Transformer",
-    "Triformer"
-]
+"""Import the selected model without loading every optional baseline."""
+
+from importlib import import_module
+
+_MODELS = {
+    "Autoformer": "ts_benchmark.baselines.time_series_library.models.Autoformer",
+    "Crossformer": "ts_benchmark.baselines.time_series_library.models.Crossformer",
+    "DLinear": "ts_benchmark.baselines.time_series_library.models.DLinear",
+    "ETSformer": "ts_benchmark.baselines.time_series_library.models.ETSformer",
+    "FEDformer": "ts_benchmark.baselines.time_series_library.models.FEDformer",
+    "FiLM": "ts_benchmark.baselines.time_series_library.models.FiLM",
+    "Informer": "ts_benchmark.baselines.time_series_library.models.Informer",
+    "iTransformer": "ts_benchmark.baselines.time_series_library.models.iTransformer",
+    "Koopa": "ts_benchmark.baselines.time_series_library.models.Koopa",
+    "LightTS": "ts_benchmark.baselines.time_series_library.models.LightTS",
+    "Linear": "ts_benchmark.baselines.time_series_library.patchs.Linear",
+    "MICN": "ts_benchmark.baselines.time_series_library.models.MICN",
+    "NLinear": "ts_benchmark.baselines.time_series_library.patchs.NLinear",
+    "Nonstationary_Transformer": "ts_benchmark.baselines.time_series_library.models.Nonstationary_Transformer",
+    "PatchTST": "ts_benchmark.baselines.time_series_library.models.PatchTST",
+    "Pyraformer": "ts_benchmark.baselines.time_series_library.models.Pyraformer",
+    "Reformer": "ts_benchmark.baselines.time_series_library.models.Reformer",
+    "TimesNet": "ts_benchmark.baselines.time_series_library.models.TimesNet",
+    "Transformer": "ts_benchmark.baselines.time_series_library.models.Transformer",
+    "Triformer": "ts_benchmark.baselines.time_series_library.patchs.Triformer",
+}
+
+__all__ = list(_MODELS)
 
 
-from ts_benchmark.baselines.time_series_library.models.Autoformer import Autoformer
-from ts_benchmark.baselines.time_series_library.models.Crossformer import Crossformer
-from ts_benchmark.baselines.time_series_library.models.DLinear import DLinear
-from ts_benchmark.baselines.time_series_library.models.ETSformer import ETSformer
-from ts_benchmark.baselines.time_series_library.models.FEDformer import FEDformer
-from ts_benchmark.baselines.time_series_library.models.FiLM import FiLM
-from ts_benchmark.baselines.time_series_library.models.Informer import Informer
-from ts_benchmark.baselines.time_series_library.models.iTransformer import iTransformer
-from ts_benchmark.baselines.time_series_library.models.Koopa import Koopa
-from ts_benchmark.baselines.time_series_library.models.LightTS import LightTS
-from ts_benchmark.baselines.time_series_library.patchs.Linear import Linear
-from ts_benchmark.baselines.time_series_library.models.MICN import MICN
-from ts_benchmark.baselines.time_series_library.patchs.NLinear import NLinear
-from ts_benchmark.baselines.time_series_library.models.Nonstationary_Transformer import Nonstationary_Transformer
-from ts_benchmark.baselines.time_series_library.models.PatchTST import PatchTST
-from ts_benchmark.baselines.time_series_library.models.Pyraformer import Pyraformer
-from ts_benchmark.baselines.time_series_library.models.Reformer import Reformer
-from ts_benchmark.baselines.time_series_library.models.TimesNet import TimesNet
-from ts_benchmark.baselines.time_series_library.models.Transformer import Transformer
-from ts_benchmark.baselines.time_series_library.patchs.Triformer import Triformer
+def __getattr__(name):
+    if name not in _MODELS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    model = getattr(import_module(_MODELS[name]), name)
+    globals()[name] = model
+    return model
 
 

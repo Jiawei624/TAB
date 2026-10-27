@@ -69,6 +69,11 @@ class metricor:
         MaxValue = 0
         start = AnomalyRange[0]
         AnomalyLength = AnomalyRange[1] - AnomalyRange[0] + 1
+        if self.bias == "flat":
+            return (
+                np.searchsorted(p, AnomalyRange[1], side="right")
+                - np.searchsorted(p, start, side="left")
+            ) / AnomalyLength
         for i in range(start, start + AnomalyLength):
             bi = self.b(i, AnomalyLength)
             MaxValue += bi
@@ -127,18 +132,16 @@ class metricor:
              
             k is chosen to be # of outliers in real labels
         """
-        if np.sum(label) == 0:
-            print(
-                "All labels are 0. Label must have groud truth value for calculating AUC score."
-            )
-            return None
-
-        if np.isnan(score).any() or score is None:
-            print("Score must not be none.")
-            return None
+        if score is None:
+            raise ValueError("Score must not be None")
+        label, score = np.asarray(label), np.asarray(score)
+        if label.ndim != 1 or score.shape != label.shape or len(label) == 0:
+            raise ValueError("Labels and predictions must be nonempty aligned vectors")
+        if not np.isfinite(score).all():
+            raise ValueError("Predictions must be finite")
 
         # area under curve
-        auc = metrics.roc_auc_score(label, score)
+        auc = metrics.roc_auc_score(label, score) if len(np.unique(label)) == 2 else np.nan
         # plor ROC curve
         if plot_ROC:
             fpr, tpr, thresholds = metrics.roc_curve(label, score)
@@ -149,7 +152,7 @@ class metricor:
         preds = score
         # preds = score > (np.mean(score) + 3 * np.std(score))
         Precision, Recall, F, Support = metrics.precision_recall_fscore_support(
-            label, preds, zero_division=0
+            label, preds, labels=[0, 1], zero_division=0
         )
         precision = Precision[1]
         recall = Recall[1]
@@ -168,12 +171,18 @@ class metricor:
 
         # top-k
         k = int(np.sum(label))
-        threshold = np.percentile(score, 100 * (1 - k / len(label)))
-
-        # precision_at_k = metrics.top_k_accuracy_score(label, score, k)
-        p_at_k = np.where(preds > threshold)[0]
-        TP_at_k = sum(label[p_at_k])
-        precision_at_k = TP_at_k / k
+        if k:
+            # Include exactly k predictions. Average ties at the boundary,
+            # avoiding arbitrary time-order preference for binary scores.
+            threshold = np.partition(score, len(score) - k)[len(score) - k]
+            above = score > threshold
+            tied = score == threshold
+            true_positives = label[above].sum() + (
+                (k - above.sum()) * label[tied].mean()
+            )
+            precision_at_k = true_positives / k
+        else:
+            precision_at_k = np.nan
 
         L = [
             auc,
@@ -224,32 +233,10 @@ class metricor:
         input: arrays of binary values 
         output: list of ordered pair [[a0,b0], [a1,b1]... ] of the inputs
         """
-        L = []
-        i = 0
-        j = 0
-        while j < len(label):
-            # print(i)
-            while label[i] == 0:
-                i += 1
-                if i >= len(label):
-                    break
-            j = i + 1
-            # print('j'+str(j))
-            if j >= len(label):
-                if j == len(label):
-                    L.append((i, j - 1))
-
-                break
-            while label[j] != 0:
-                j += 1
-                if j >= len(label):
-                    L.append((i, j - 1))
-                    break
-            if j >= len(label):
-                break
-            L.append((i, j - 1))
-            i = j
-        return L
+        edges = np.diff(np.r_[0, (np.asarray(label) != 0).astype(np.int8), 0])
+        starts = np.flatnonzero(edges == 1)
+        ends = np.flatnonzero(edges == -1) - 1
+        return list(zip(starts, ends))
 
     def existence_reward(self, labels, preds):
         """
@@ -259,7 +246,7 @@ class metricor:
 
         score = 0
         for i in labels:
-            if np.sum(np.multiply(preds <= i[1], preds >= i[0])) > 0:
+            if np.searchsorted(preds, i[1], side="right") > np.searchsorted(preds, i[0]):
                 score += 1
         return score
 

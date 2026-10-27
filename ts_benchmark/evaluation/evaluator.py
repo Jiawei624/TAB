@@ -73,11 +73,13 @@ class Evaluator:
 
         if isinstance(hist_data, pd.DataFrame):
             hist_data_np = hist_data.values
-        else:
+        elif hist_data is not None:
             hist_data_np = hist_data.reshape(-1, hist_data.shape[1])
+        else:
+            hist_data_np = None
 
         return [
-            m(actual, predicted, scaler=scaler, hist_data=hist_data_np)
+            m(actual, predicted, scaler=scaler, hist_data=hist_data_np, **kwargs)
             for m in self.metric_funcs
         ]
 
@@ -100,14 +102,14 @@ class Evaluator:
         """
         evaluate_result = []
         log_info = ""
-        for m in self.metric_funcs:
+        for metric_name, m in zip(self.metric_names, self.metric_funcs):
             try:
                 evaluate_result.append(
-                    m(actual, predicted, scaler=scaler, hist_data=hist_data)
+                    m(actual, predicted, scaler=scaler, hist_data=hist_data, **kwargs)
                 )
             except Exception as e:
                 evaluate_result.append(np.nan)
-                log_info += f"Error in calculating {m.__name__}: {traceback.format_exc()}\n{e}\n"
+                log_info += f"Error in calculating {metric_name}: {traceback.format_exc()}\n{e}\n"
         return evaluate_result, log_info
 
     def default_result(self):

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import argparse
+import copy
 import json
 import logging
 import os
@@ -29,8 +30,9 @@ def build_data_config(args: argparse.Namespace, config_data: Dict) -> Dict:
     """
     Builds the data loader config from commandline arguments and configuration dict
     """
-    data_config = config_data["data_config"]
-    data_config["data_name_list"] = args.data_name_list
+    data_config = copy.deepcopy(config_data["data_config"])
+    if args.data_name_list is not None:
+        data_config["data_name_list"] = args.data_name_list
     if args.data_set_name is not None:
         data_config["data_set_name"] = args.data_set_name
     return data_config
@@ -41,9 +43,11 @@ def build_model_config(args: argparse.Namespace, config_data: Dict) -> Dict:
     """
     Builds the model config from commandline arguments and configuration dict
     """
-    model_config = config_data.get("model_config", None)
+    model_config = copy.deepcopy(config_data["model_config"])
 
     if args.adapter is not None:
+        if len(args.adapter) > len(args.model_name):
+            raise ValueError("More adapters than model names")
         args.adapter = [None if item == "None" else item for item in args.adapter]
         if len(args.model_name) > len(args.adapter):
             args.adapter.extend([None] * (len(args.model_name) - len(args.adapter)))
@@ -51,6 +55,8 @@ def build_model_config(args: argparse.Namespace, config_data: Dict) -> Dict:
         args.adapter = [None] * len(args.model_name)
 
     if args.model_hyper_params is not None:
+        if len(args.model_hyper_params) > len(args.model_name):
+            raise ValueError("More model hyperparameter sets than model names")
         args.model_hyper_params = [
             None if item == "None" else item for item in args.model_hyper_params
         ]
@@ -64,15 +70,14 @@ def build_model_config(args: argparse.Namespace, config_data: Dict) -> Dict:
     for adapter, model_name, model_hyper_params in zip(
         args.adapter, args.model_name, args.model_hyper_params
     ):
+        hyper_params = json.loads(model_hyper_params) if model_hyper_params is not None else {}
+        if not isinstance(hyper_params, dict):
+            raise ValueError("Each model's hyperparameters must be a JSON object")
         model_config["models"].append(
             {
                 "adapter": adapter,
                 "model_name": model_name,
-                "model_hyper_params": (
-                    json.loads(model_hyper_params)
-                    if model_hyper_params is not None
-                    else {}
-                ),
+                "model_hyper_params": hyper_params,
             }
         )
 
@@ -84,13 +89,20 @@ def build_evaluation_config(args: argparse.Namespace, config_data: Dict) -> Dict
     """
     Builds the evaluation config from commandline arguments and configuration dict
     """
-    evaluation_config = config_data["evaluation_config"]
+    evaluation_config = copy.deepcopy(config_data["evaluation_config"])
 
     metric_list = []
     # 希望使用配置中的全部指标时，直接省略--metrics
-    if args.metrics != "all" and args.metrics is not None:
+    if args.metrics == ["all"] or args.metrics == "all":
+        evaluation_config["metrics"] = "all"
+    elif args.metrics is not None:
         for metric in args.metrics:
-            metric = json.loads(metric)
+            try:
+                metric = json.loads(metric)
+            except json.JSONDecodeError:
+                pass  # Bare metric names such as --metrics f_score add.
+            if not isinstance(metric, (str, dict)):
+                raise ValueError("Metrics must be names or JSON objects")
             metric_list.append(metric)
         evaluation_config["metrics"] = metric_list
 
@@ -113,9 +125,11 @@ def build_report_config(args: argparse.Namespace, config_data: Dict) -> Dict:
     """
     Builds the report config from commandline arguments and configuration dict
     """
-    report_config = config_data["report_config"]
-    report_config["aggregate_type"] = args.aggregate_type
-    report_config["save_path"] = args.save_path
+    report_config = copy.deepcopy(config_data["report_config"])
+    if args.aggregate_type is not None:
+        report_config["aggregate_type"] = args.aggregate_type
+    if args.save_path is not None:
+        report_config["save_path"] = args.save_path
 
     return report_config
 
@@ -242,7 +256,7 @@ if __name__ == "__main__":
         type=int,
         nargs="+",
         default=None,
-        help="List of gpu devices to use, only available in ray backends",
+        help="GPU IDs exposed to the selected backend; model data parallelism is a separate option",
     )
 
     # 指定Ray后端创建worker的数量
@@ -250,7 +264,7 @@ if __name__ == "__main__":
         "--num-workers",
         type=int,
         default=os.cpu_count(),
-        help="Number of evaluation workers",
+        help="Number of independent evaluation workers (Ray only); not training replicas",
     )
 
     # TODO: should timeout be part of the configuration file?
@@ -260,7 +274,7 @@ if __name__ == "__main__":
         type=float,
         # default=600,
         default=3600,
-        help="Time limit for each evaluation task, in seconds",
+        help="Time limit for each Ray evaluation task, in seconds; ignored by sequential",
     )
 
     # 每个Ray worker最多连续执行的任务数量
@@ -273,9 +287,10 @@ if __name__ == "__main__":
 
     # 指定结果聚合方式
     parser.add_argument(
-        "--aggregate_type",
-        default="mean",
-        help="Select the baseline algorithm to compare",
+        "--aggregate-type", "--aggregate_type",
+        default=None,
+        choices=["mean", "median", "min", "max"],
+        help="Report aggregation across series; defaults to the configuration value",
     )
 
     # 指定结果展示方式
@@ -300,6 +315,16 @@ if __name__ == "__main__":
 
     # 解析参数与日志初始化
     args = parser.parse_args()
+    if args.num_workers < 1 or args.num_cpus < 1:
+        parser.error("--num-workers and --num-cpus must be positive")
+    if args.gpus is not None and (
+        any(device < 0 for device in args.gpus) or len(set(args.gpus)) != len(args.gpus)
+    ):
+        parser.error("--gpus must contain unique nonnegative GPU IDs")
+    if args.gpus is not None:
+        # Do this before any model import or CUDA initialization. Device IDs
+        # inside models are then local to this visibility mask (0, 1, ...).
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, args.gpus))
 
     logging.basicConfig(
         level=logging.INFO,
@@ -308,7 +333,7 @@ if __name__ == "__main__":
     )
 
     torch.set_num_threads(3)
-    with open(os.path.join(CONFIG_PATH, args.config_path), "r") as file:
+    with open(os.path.join(CONFIG_PATH, args.config_path), "r", encoding="utf-8") as file:
         config_data = json.load(file)
 
     required_configs = [
@@ -332,7 +357,7 @@ if __name__ == "__main__":
         n_workers=args.num_workers,
         n_cpus=args.num_cpus,
         gpu_devices=args.gpus,
-        default_timeout=args.timeout,
+        default_timeout=args.timeout if args.eval_backend == "ray" else -1,
         max_tasks_per_child=args.max_tasks_per_child,
         worker_initializers=[init_worker],
     )
@@ -342,7 +367,7 @@ if __name__ == "__main__":
             data_config,
             model_config,
             evaluation_config,
-            save_path=args.save_path,
+            save_path=report_config.get("save_path"),
         )
 
     finally:
@@ -351,6 +376,6 @@ if __name__ == "__main__":
     report_config["log_files_list"] = log_filenames
     if args.report_method == "csv":
         filename = get_unique_file_suffix()
-        leaderboard_file_name = "test_report" + filename
+        leaderboard_file_name = "test_report" + filename + ".csv"
         report_config["leaderboard_file_name"] = leaderboard_file_name
     report(report_config, report_method=args.report_method)

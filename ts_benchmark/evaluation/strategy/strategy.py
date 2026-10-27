@@ -229,7 +229,9 @@ class Strategy(metaclass=abc.ABCMeta):
                     "the configuration dict"
                 )
 
-            return config_value.get(series_name, config_value[self.DEFAULT_CONFIG_KEY])
+            if series_name in config_value:
+                return config_value[series_name]
+            return config_value[self.DEFAULT_CONFIG_KEY]
         else:
             return config_value
 

@@ -61,19 +61,21 @@ ADD 不会自行选择阈值，也不会根据测试标签搜索最优阈值。
 比例记录在 `typical_anomaly_ratio` 列中。CSV 和 Dash 汇总报告均可通过
 `report_metrics` 选择 `add`。
 
-报告沿用 TAB 的聚合方式：先对同一模型、同一序列的多条记录取均值，再按
-`aggregate_type` 跨序列汇总；这不同于把所有序列的异常区间合并后计算 ADD。
-比较指定阈值下的延迟时，应固定 `anomaly_ratio`，或先筛选对应的结果行。
+报告按模型参数和 `anomaly_ratio` 区分结果；存在多个比例时，报告列名附带
+`;anomaly_ratio=...`，各比例分别汇总。同一模型、同一比例、同一序列的重复记录
+先取均值，再按 `aggregate_type` 跨序列汇总；这不同于把所有序列的异常区间合并后
+计算 ADD。比较指定阈值下的延迟时，应固定 `anomaly_ratio`。
 `NaN` 沿用 `fill_type` 和 `null_value_threshold` 的现有处理规则；不要将其当作 0。
 
 ADD 不惩罚异常区间外的误报，全预测异常会得到 0，应结合 F1 或精确率评估。
 不同采样间隔、异常区间长度的序列，其原始 ADD 也不宜直接解释为相同的实际延迟。
-预测长度不足时，TAB 仍沿用末尾补 0 的对齐逻辑，补齐部分按未检出处理。
+AnomalyTransformer 对最后不足一个窗口的数据采用末值补齐，只保留真实采样点的
+预测。其他模型若返回较短预测，检测策略会在末尾补 0，并在 `log_info` 中记录补齐
+数量；补齐部分按未检出处理。超过测试长度或形状不符的预测会记录为任务错误。
 
 ## 验证
 
-本地验证脚本为 `tests/test_add_metric.py`。当前工作区忽略了 `tests/`，脚本不包含在
-本次 Git 提交中；若要在服务器复跑验证，需要一并复制该脚本。
+验证脚本位于 `tests/test_add_metric.py`，随仓库分发。
 
 在 TAB 仓库根目录和已安装项目依赖的环境中运行：
 
@@ -82,3 +84,5 @@ python -m unittest discover -s tests -p test_add_metric.py -v
 ```
 
 验证包括延迟边界、漏检、点调整顺序，以及配置到检测策略、记录读写和 CSV 报告的流程。
+完整检查和双 GPU 验证命令见 [仓库检查记录](repository_audit.md) 与
+[AnomalyTransformer 多 GPU 运行](multi_gpu.md)。

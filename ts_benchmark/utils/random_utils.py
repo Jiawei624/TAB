@@ -25,7 +25,8 @@ def fix_all_random_seed(seed: Optional[int] = 2021) -> NoReturn:
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.enabled = False
-    torch.cuda.manual_seed(seed)
-
-    os.environ['PYTHONHASHSEED'] = str(1)
+    # Keep cuDNN available; deterministic algorithms and disabled benchmarking
+    # control its reproducibility without disabling GPU convolution acceleration.
+    # Python reads this setting at interpreter startup, so this assignment only
+    # controls subsequently started child interpreters.
+    os.environ["PYTHONHASHSEED"] = str(seed)
