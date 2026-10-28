@@ -51,10 +51,10 @@ def check_recurrence(device,channels,steps):
     return result
 
 
-def check_frozen_evidence(device,channels,backend="canonical"):
+def check_frozen_evidence(device,channels,backend="canonical",hidden_dim=32):
     """Exercise the real FP32 kernels and repeated atoms; no training/data download."""
     torch.manual_seed(42)
-    model = ASEI(device=str(device),seed=42,frozen_evidence_backend=backend)
+    model = ASEI(device=str(device),seed=42,frozen_evidence_backend=backend,hidden_dim=hidden_dim)
     model._resolve_capacity(8192)
     model.columns_ = [f"channel_{i}" for i in range(channels)]
     cfg = model.config
@@ -79,6 +79,7 @@ def check_frozen_evidence(device,channels,backend="canonical"):
     model._freeze(model.scorer)
     result = frozen_numeric_probe(model,values)
     result.update(check="frozen_evidence",implementation=IMPLEMENTATION_VERSION,device=str(device),channels=channels,
+                  hidden_dim=cfg.hidden_dim,
                   scope="Synthetic frozen-kernel correctness only; no model training or detection-quality claim")
     print(json.dumps(result),flush=True)
     if not result["evidence_consistency_passed"]:
@@ -93,6 +94,7 @@ def main():
     parser.add_argument("--gpus",type=int,nargs=1,default=[1])
     parser.add_argument("--device",default="auto")
     parser.add_argument("--channels",type=int,default=51)
+    parser.add_argument("--hidden-dim",type=int,default=32)
     parser.add_argument("--batch-size",type=int,default=8,help="Number of continuous target blocks")
     parser.add_argument("--win-size",type=int,default=63)
     parser.add_argument("--batches",type=int,default=2)
@@ -102,7 +104,7 @@ def main():
     parser.add_argument("--frozen-only",action="store_true",help="Check real frozen kernels without training predictor batches")
     parser.add_argument("--frozen-backend",choices=["canonical","legacy"],default="canonical")
     args = parser.parse_args()
-    if min(args.channels,args.batch_size,args.win_size,args.batches,args.threads,args.score_steps,
+    if min(args.channels,args.hidden_dim,args.batch_size,args.win_size,args.batches,args.threads,args.score_steps,
            args.gpus[0]+1,*args.block_sizes)<1:
         parser.error("Counts must be positive and the GPU ID nonnegative")
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpus[0])
@@ -110,10 +112,11 @@ def main():
     torch.set_num_threads(args.threads)
     if args.frozen_only:
         device = ASEI(device=args.device).device
-        check_frozen_evidence(device,args.channels,args.frozen_backend)
+        check_frozen_evidence(device,args.channels,args.frozen_backend,args.hidden_dim)
         return
     for block in args.block_sizes:
-        model = ASEI(device=args.device,batch_size=args.batch_size,predictor_block_size=block,win_size=args.win_size)
+        model = ASEI(device=args.device,batch_size=args.batch_size,predictor_block_size=block,win_size=args.win_size,
+                     hidden_dim=args.hidden_dim)
         model._resolve_capacity(8192)
         count = args.batch_size*block*args.batches
         values = np.random.default_rng(42).normal(size=(model.history+count,args.channels)).astype(np.float32)
@@ -134,11 +137,12 @@ def main():
         print(json.dumps(dict(implementation=IMPLEMENTATION_VERSION,device=str(model.device),
                               GPU=torch.cuda.get_device_name(model.device) if model.device.type=="cuda" else None,
                               block_size=block,blocks_per_batch=cfg.batch_size,batches=len(loader),
+                              hidden_dim=cfg.hidden_dim,
                               target_points=count,seconds=elapsed,target_points_per_second=count/elapsed,loss=loss)),flush=True)
         device = model.device
         del loader,optimizer,model
     check_recurrence(device,args.channels,args.score_steps)
-    check_frozen_evidence(device,args.channels,args.frozen_backend)
+    check_frozen_evidence(device,args.channels,args.frozen_backend,args.hidden_dim)
 
 
 if __name__=="__main__":

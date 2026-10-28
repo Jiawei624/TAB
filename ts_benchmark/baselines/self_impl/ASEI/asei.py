@@ -25,6 +25,7 @@ from .model import ErrorCorrector, EvidenceScorer, Predictor, cpu_state, lag_gra
 from .optimization import fit_corrector
 from .protocol import AuxiliaryProtocol, select_protocol
 from .progress import IMPLEMENTATION_VERSION, Progress
+from .training import make_scheduler, profile_options, score_optimizer
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +34,12 @@ logger = logging.getLogger(__name__)
 class Config:
     seed: int = 2026
     device: str = "auto"
+    training_profile: str = "original"
     lr: object = None
     num_epochs: object = None
     win_size: int = 63
     hidden_dim: object = None
+    hidden_dim_candidates: object = None
     embedding_dim: int = 8
     kernel_size: int = 3
     dilations: tuple = (1,2,4,8,16)
@@ -51,13 +54,18 @@ class Config:
     learning_rate: float = 1e-3
     predictor_weight_decay: float = 1e-4
     predictor_amp: str = "off"
+    predictor_gradient_clip: object = None
+    predictor_scheduler: str = "none"
+    predictor_lr_patience: int = 3
     num_workers: int = 0
     ar_order: int = 4
     rho: float = .95
     corrector_batch_size: int = 2048
     corrector_linear_steps: int = 100
+    corrector_linear_epochs: object = None
     corrector_linear_lr: float = 1e-2
     corrector_nonlinear_steps: int = 100
+    corrector_nonlinear_epochs: object = None
     corrector_nonlinear_lr: float = 1e-3
     error_scale_floor: float = 1e-4
     nonlinear_iqr_fraction: float = .1
@@ -84,6 +92,11 @@ class Config:
     score_min_epochs: int = 3
     score_patience: int = 3
     score_learning_rate: float = 1e-3
+    score_bias_learning_rate: object = None
+    score_scheduler: str = "none"
+    score_lr_patience: int = 5
+    lr_decay_factor: float = .5
+    minimum_learning_rate: float = 1e-5
     score_gradient_clip: float = 1.
     evidence_chunk_size: int = 1024
     frozen_evidence_backend: str = "canonical"
@@ -116,12 +129,7 @@ class ASEI:
             raise ValueError(f"Unknown ASEI hyperparameters: {sorted(unknown)}. "
                              "ASEI 1.4 uses one trainable-kappa scorer and fixed-budget corrector; "
                              "remove legacy grid, backtracking and multi_gpu options.")
-        options = dict(kwargs)
-        for alias,target in (("lr","learning_rate"),("num_epochs","predictor_epochs")):
-            if options.get(alias) is not None:
-                if target in options and options[target]!=options[alias]:
-                    raise ValueError(f"Conflicting ASEI hyperparameters: {alias} and {target}")
-                options[target] = options[alias]
+        options = profile_options(kwargs)
         self.config = Config(**options)
         self._requested_config = asdict(self.config)
         self._validate_config()
@@ -148,13 +156,14 @@ class ASEI:
 
     def _validate_config(self):
         cfg = self.config
-        optional = ("hidden_dim","predictor_block_size","batch_size","auxiliary_train_pairs")
+        optional = ("hidden_dim","predictor_block_size","batch_size","auxiliary_train_pairs",
+                    "corrector_linear_epochs","corrector_nonlinear_epochs")
         positive = ("win_size","embedding_dim","kernel_size","graph_neighbors","graph_sample_cap",
                     "predictor_epochs","predictor_min_epochs","predictor_patience","ar_order","rolling_window",
                     "corrector_batch_size","corrector_linear_steps","corrector_nonlinear_steps",
                     "auxiliary_validation_pairs","auxiliary_batch_size","hard_pool_size","perturbation_attempts",
                     "rank_pairs_per_event","score_epochs","score_min_epochs","score_patience",
-                    "evidence_chunk_size","scan_chunk_size")
+                    "evidence_chunk_size","scan_chunk_size","predictor_lr_patience","score_lr_patience")
         for name in positive+optional:
             value = getattr(cfg,name)
             if name in optional and value is None:
@@ -171,6 +180,22 @@ class ASEI:
             value = getattr(cfg,name)
             if isinstance(value,bool) or not np.isfinite(value) or value<=0:
                 raise ValueError(f"{name} must be finite and positive")
+        for name in ("predictor_gradient_clip","score_bias_learning_rate"):
+            value = getattr(cfg,name)
+            if value is not None and (isinstance(value,bool) or not np.isfinite(value) or value<=0):
+                raise ValueError(f"{name} must be finite and positive or None")
+        if not np.isfinite(cfg.minimum_learning_rate) or cfg.minimum_learning_rate<=0:
+            raise ValueError("minimum_learning_rate must be finite and positive")
+        if not 0<cfg.lr_decay_factor<1:
+            raise ValueError("lr_decay_factor must be in (0,1)")
+        for stage in ("predictor","score"):
+            if getattr(cfg,f"{stage}_scheduler") not in ("none","plateau"):
+                raise ValueError(f"{stage}_scheduler must be none or plateau")
+        candidates = cfg.hidden_dim_candidates
+        if candidates is not None and (not isinstance(candidates,(tuple,list)) or not candidates or
+                any(isinstance(v,bool) or not isinstance(v,int) or v<1 for v in candidates) or
+                len(set(candidates))!=len(candidates)):
+            raise ValueError("hidden_dim_candidates must contain distinct positive integers")
         for name in ("evidence_device_cache_mb","evidence_host_cache_mb","predictor_weight_decay","nonlinear_iqr_fraction"):
             value = getattr(cfg,name)
             if not np.isfinite(value) or value<0:
@@ -303,6 +328,8 @@ class ASEI:
                     loss = numerator/denominator
                 if training:
                     loss.backward()
+                    if self.config.predictor_gradient_clip is not None:
+                        nn.utils.clip_grad_norm_(self.predictor.parameters(),self.config.predictor_gradient_clip)
                     optimizer.step()
                 total += numerator.detach()
                 count += denominator
@@ -321,36 +348,73 @@ class ASEI:
 
     def _fit_predictor(self,fit,validation):
         cfg = self.config
-        torch.manual_seed(self._stage_seed(20))
         with self._stage("graph"):
             graph = lag_graph(fit,cfg.graph_lags,cfg.graph_neighbors,cfg.graph_sample_cap)
-        self.predictor = Predictor(len(self.columns_),*graph,hidden=cfg.hidden_dim,embedding=cfg.embedding_dim,
+        widths = tuple(cfg.hidden_dim_candidates) if cfg.hidden_dim_candidates is not None else (cfg.hidden_dim,)
+        candidates,best_key = [],None
+        with self._stage("predictor"):
+            for order,width in enumerate(widths):
+                result = self._fit_predictor_candidate(fit,validation,graph,width)
+                candidates.append(result)
+                key = (result["best_validation_huber"],result["best_epoch"],order)
+                if best_key is None or key<best_key:
+                    best_key,best_state,selected = key,cpu_state(self.predictor),order
+        cfg.hidden_dim = widths[selected]
+        if cfg.hidden_dim!=widths[-1]:
+            self.predictor = Predictor(len(self.columns_),*graph,hidden=cfg.hidden_dim,embedding=cfg.embedding_dim,
+                                       kernel=cfg.kernel_size,dilations=cfg.dilations,win_size=cfg.win_size).to(self.device)
+        self.predictor.load_state_dict(best_state)
+        self._freeze(self.predictor)
+        self.metadata_["resolved_config"] = asdict(cfg)
+        self.metadata_["predictor"] = candidates[selected]
+        self.metadata_["capacity_selection"] = dict(
+            criterion="minimum normal Vsel Huber; ties: earlier checkpoint, then candidate order",
+            candidates=list(widths),selected_hidden_dim=cfg.hidden_dim,
+            total_optimizer_steps=sum(row["optimizer_steps"] for row in candidates),results=candidates)
+        logger.info("ASEI predictor selected hidden=%d parameters=%d best_epoch=%d Vsel=%.8g candidates=%s",
+                    cfg.hidden_dim,candidates[selected]["parameters"],candidates[selected]["best_epoch"],best_key[0],list(widths))
+
+    def _fit_predictor_candidate(self,fit,validation,graph,width):
+        cfg = self.config
+        # Every width gets the same data order and its own reproducible initialization.
+        torch.manual_seed(self._stage_seed(20))
+        self.predictor = Predictor(len(self.columns_),*graph,hidden=width,embedding=cfg.embedding_dim,
                                    kernel=cfg.kernel_size,dilations=cfg.dilations,win_size=cfg.win_size).to(self.device)
         train_loader,valid_loader = self._predictor_loader(fit,True),self._predictor_loader(validation,False)
         optimizer = torch.optim.AdamW(self.predictor.parameters(),lr=cfg.learning_rate,weight_decay=cfg.predictor_weight_decay)
+        scheduler = make_scheduler(optimizer,cfg,"predictor")
         best_loss,stale,history = float("inf"),0,[]
-        with self._stage("predictor"):
-            for epoch in range(1,cfg.predictor_epochs+1):
-                train_loss = self._predictor_loss(train_loader,optimizer,epoch)
-                training_targets = self._last_predictor_pass["targets_seen"]
-                val_loss = self._predictor_loss(valid_loader,epoch=epoch)
-                history.append(dict(epoch=epoch,train_huber=train_loss,validation_huber=val_loss,
-                                    training_targets=training_targets,
-                                    validation_targets=self._last_predictor_pass["targets_seen"]))
-                if val_loss<best_loss:
-                    best_loss,best,best_epoch,stale = val_loss,cpu_state(self.predictor),epoch,0
-                else:
-                    stale += 1
-                logger.info("ASEI predictor epoch=%d train=%.7g Vsel=%.7g",epoch,train_loss,val_loss)
-                if epoch>=min(cfg.predictor_min_epochs,cfg.predictor_epochs) and stale>=cfg.predictor_patience:
-                    break
+        stopped = False
+        for epoch in range(1,cfg.predictor_epochs+1):
+            lr = optimizer.param_groups[0]["lr"]
+            train_loss = self._predictor_loss(train_loader,optimizer,epoch)
+            training_targets = self._last_predictor_pass["targets_seen"]
+            val_loss = self._predictor_loss(valid_loader,epoch=epoch)
+            if scheduler is not None:
+                scheduler.step(val_loss)
+            history.append(dict(epoch=epoch,train_huber=train_loss,validation_huber=val_loss,
+                                learning_rate=lr,next_learning_rate=optimizer.param_groups[0]["lr"],
+                                training_targets=training_targets,
+                                validation_targets=self._last_predictor_pass["targets_seen"]))
+            if val_loss<best_loss:
+                best_loss,best,best_epoch,stale = val_loss,cpu_state(self.predictor),epoch,0
+            else:
+                stale += 1
+            logger.info("ASEI predictor epoch=%d train=%.7g Vsel=%.7g hidden=%d lr=%.7g next_lr=%.7g",
+                        epoch,train_loss,val_loss,width,lr,optimizer.param_groups[0]["lr"])
+            if epoch>=min(cfg.predictor_min_epochs,cfg.predictor_epochs) and stale>=cfg.predictor_patience:
+                stopped = True
+                break
         self.predictor.load_state_dict(best)
         self._freeze(self.predictor)
-        self.metadata_["predictor"] = dict(best_epoch=best_epoch,actual_epochs=epoch,history=history,
-                                          targets_per_epoch=len(fit)-self.history,
-                                          optimizer_steps=epoch*len(train_loader),blocks_per_batch=cfg.batch_size,
-                                          target_block_size=cfg.predictor_block_size,graph_edges=int(graph[2].sum()),
-                                          graph_targets=min(len(fit)-max(cfg.graph_lags),cfg.graph_sample_cap))
+        return dict(hidden_dim=width,parameters=sum(p.numel() for p in self.predictor.parameters()),
+                    best_epoch=best_epoch,best_validation_huber=best_loss,actual_epochs=epoch,history=history,
+                    stop_reason="validation_patience" if stopped else "epoch_limit",
+                    reached_epoch_limit=epoch==cfg.predictor_epochs,best_at_epoch_limit=best_epoch==epoch==cfg.predictor_epochs,
+                    targets_per_epoch=len(fit)-self.history,
+                    optimizer_steps=epoch*len(train_loader),blocks_per_batch=cfg.batch_size,
+                    target_block_size=cfg.predictor_block_size,graph_edges=int(graph[2].sum()),
+                    graph_targets=min(len(fit)-max(cfg.graph_lags),cfg.graph_sample_cap))
 
     @torch.inference_mode()
     def _error_tensor(self,values,progress_label=None):
@@ -507,6 +571,25 @@ class ASEI:
             _digest_array(digest,value)
         return digest.hexdigest()
 
+    @torch.no_grad()
+    def _record_normal_evidence(self,name,evidence):
+        # Reuse the already computed full normal evidence. These diagnostics do
+        # not fit references, select channels or change scores/thresholds.
+        mean = evidence.mean(0,dtype=torch.float64).float()
+        cap = (evidence+self.reference._tensor_center>=self.config.evidence_bound-2*torch.finfo(torch.float32).eps).sum(0,dtype=torch.float64)/len(evidence)
+        rows = torch.cat((mean,cap.float()),-1).cpu().tolist()
+        records = [dict(channel=str(column),mean_corrected=row[0],mean_state=row[1],
+                        corrected_cap_fraction=row[2],state_cap_fraction=row[3])
+                   for column,row in zip(self.columns_,rows)]
+        records.sort(key=lambda row:max(row["corrected_cap_fraction"],row["state_cap_fraction"]),reverse=True)
+        result = dict(evidence_points=len(evidence),channels=records,
+                      maximum_cap_fraction=max(max(row["corrected_cap_fraction"],row["state_cap_fraction"]) for row in records))
+        self.metadata_.setdefault("normal_evidence_diagnostics",{})[name] = result
+        logger.info("ASEI normal evidence split=%s points=%d top_saturated_channels=%s",name,len(evidence),records[:3])
+        if result["maximum_cap_fraction"]>=.5:
+            logger.warning("ASEI normal evidence split=%s has a channel saturated on >=50%% of points; "
+                           "a wider predictor or lower training loss does not establish reference coverage",name)
+
     def _build_bank(self,sampler,tasks,normal_evidence):
         cfg = self.config
         bank = EvidenceBank(self.device,max(0,cfg.evidence_device_cache_mb-self._cache_device_bytes/1024**2),
@@ -591,6 +674,7 @@ class ASEI:
             with self._stage("bank_build"):
                 normal = self._evidence_tensor(fit)
                 self.metadata_["counters"]["normal_evidence_passes"] += 1
+                self._record_normal_evidence("F",normal)
                 intensity = np.zeros(len(fit),dtype=np.float64)
                 intensity[self.history+cfg.ar_order:] = (normal[...,1]+
                     torch.as_tensor(self.reference.center[:,1],device=self.device)).mean(-1).cpu().numpy()
@@ -603,6 +687,7 @@ class ASEI:
                 del normal
                 normal_valid = self._evidence_tensor(validation)
                 self.metadata_["counters"]["normal_evidence_passes"] += 1
+                self._record_normal_evidence("Vsel",normal_valid)
                 valid_sampler = TaskSampler(validation,self.raw_history,scale,cfg,self.protocol_,self.seed,"Vsel",self.metadata_["data_sha256"])
                 valid_tasks = valid_sampler.validation()
                 valid_bank = self._build_bank(valid_sampler,valid_tasks,normal_valid)
@@ -613,11 +698,14 @@ class ASEI:
             self.validation_tasks_ = valid_tasks
             self.metadata_["evidence_banks"] = dict(training=train_bank.statistics(),validation=valid_bank.statistics())
             self.scorer = self._new_scorer()
-            optimizer = torch.optim.Adam(self.scorer.parameters(),lr=cfg.score_learning_rate,weight_decay=0)
+            optimizer = score_optimizer(self.scorer,cfg)
+            scheduler = make_scheduler(optimizer,cfg,"score")
             best_loss,stale,history,steps = float("inf"),0,[],0
+            stopped = False
             calls_before = self._extractor_calls
             with self._stage("scorer"):
                 for epoch in range(1,cfg.score_epochs+1):
+                    rates = [group["lr"] for group in optimizer.param_groups]
                     self.scorer.train()
                     rng = np.random.default_rng(np.random.SeedSequence([self.seed,60,epoch]))
                     batches = train_bank.batches(cfg.auxiliary_batch_size,rng)
@@ -644,10 +732,14 @@ class ASEI:
                     val_loss,groups = self._validate_bank(valid_bank)
                     if not math.isfinite(val_loss):
                         raise FloatingPointError("ASEI scorer validation loss is nonfinite")
+                    if scheduler is not None:
+                        scheduler.step(val_loss)
                     parts = (separate_total/len(train_tasks)).cpu().tolist()
                     row = dict(epoch=epoch,training_loss=float((total/len(train_tasks)).cpu()),
                                training_detection=parts[0],training_ranking=parts[1],
-                               training_tasks_seen=int(visited.sum()),validation_loss=val_loss,groups=groups)
+                               training_tasks_seen=int(visited.sum()),validation_loss=val_loss,groups=groups,
+                               learning_rates=rates,next_learning_rates=[group["lr"] for group in optimizer.param_groups],
+                               training_bias=float(self.scorer.training_bias.detach().cpu()))
                     if hasattr(self,"_last_validation_components"):
                         row["validation_components"] = copy.deepcopy(self._last_validation_components)
                     history.append(row)
@@ -656,16 +748,19 @@ class ASEI:
                     else:
                         stale += 1
                     logger.info("ASEI scorer epoch=%d Vsel_loss=%.8g lambda=%.6f kappa=%.6f "
-                                "train_det=%.8g train_rank=%.8g train_tasks=%d/%d validation_components=%s",
+                                "train_det=%.8g train_rank=%.8g train_tasks=%d/%d validation_components=%s "
+                                "lr=%s training_bias=%.6f",
                                 epoch,val_loss,float(self.scorer.decay.detach().cpu()),float(self.scorer.kappa.detach().cpu()),
-                                parts[0],parts[1],int(visited.sum()),len(train_tasks),row.get("validation_components"))
+                                parts[0],parts[1],int(visited.sum()),len(train_tasks),row.get("validation_components"),rates,row["training_bias"])
                     if epoch>=min(cfg.score_min_epochs,cfg.score_epochs) and stale>=cfg.score_patience:
+                        stopped = True
                         break
             self.metadata_["counters"]["score_epoch_feature_extractor_calls"] = self._extractor_calls-calls_before
             self.scorer.load_state_dict(best)
             self._freeze(self.scorer)
             self.metadata_["selection"] = dict(epoch=best_epoch,loss=best_loss,actual_epochs=epoch,
                                                 optimizer_steps=steps,scorer_instances=1,
+                                                stop_reason="validation_patience" if stopped else "epoch_limit",
                                                 reached_epoch_limit=epoch==cfg.score_epochs,
                                                 best_at_epoch_limit=best_epoch==epoch==cfg.score_epochs)
             self.metadata_["selection_history"] = history
@@ -707,6 +802,9 @@ class ASEI:
                 records.append(dict(alpha=alpha,N=n,K=int(np.floor(alpha*n)),threshold=threshold,
                                     false_alarm_count=count,actual_false_alarm_rate=count/n,resolution=1/n))
         self.metadata_["calibration"] = records
+        self.metadata_["calibration_score_quantiles"] = dict(zip(
+            ("minimum","median","p90","p99","maximum"),
+            np.quantile(self.validation_scores_,[0,.5,.9,.99,1]).tolist()))
         logger.info("ASEI calibration coverage ready_scores=%d/%d records=%s",len(self.validation_scores_),expected,records)
 
     def detect_fit(self,train_data,train_label=None,valid_data=None):
@@ -765,6 +863,11 @@ class ASEI:
         logger.info("ASEI implementation=%s device=%s splits=%s capacity=(d=%d Q=%d Bp=%d MA=%d) protocol=%s",
                     IMPLEMENTATION_VERSION,self.device,bounds,cfg.hidden_dim,cfg.predictor_block_size,cfg.batch_size,
                     cfg.auxiliary_train_pairs,asdict(self.protocol_))
+        logger.info("ASEI training profile=%s widths=%s predictor=(epochs=%d lr=%.7g scheduler=%s patience=%d) "
+                    "scorer=(epochs=%d lr=%.7g bias_lr=%s scheduler=%s patience=%d)",
+                    cfg.training_profile,cfg.hidden_dim_candidates or [cfg.hidden_dim],cfg.predictor_epochs,
+                    cfg.learning_rate,cfg.predictor_scheduler,cfg.predictor_patience,cfg.score_epochs,
+                    cfg.score_learning_rate,cfg.score_bias_learning_rate,cfg.score_scheduler,cfg.score_patience)
         self._fit_predictor(parts["F"],parts["Vsel"])
         self._fit_corrector(parts["Cfit"])
         self._fit_reference(parts["Rref"])

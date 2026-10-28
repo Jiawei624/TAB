@@ -1,10 +1,10 @@
 # ASEI 运行与配置
 
-实现依据工作区的 [In1_1_4.md](../../In1_1_4.md) 和 [impl.md](../../impl.md)，TAB 入口为 `self_impl.ASEI`。每个文件分别拟合预测器、校正器、评分器和阈值。模型使用一张 CUDA GPU；`device="auto"` 在 CUDA 不可用时使用 CPU。完整默认值见 [Config](../ts_benchmark/baselines/self_impl/ASEI/asei.py)，实现版本为 `asei-finite-bank-scan-3.3`。
+实现依据工作区的 [In1_1_4.md](../../In1_1_4.md) 和 [impl.md](../../impl.md)，TAB 入口为 `self_impl.ASEI`。每个文件分别拟合预测器、校正器、评分器和阈值。模型使用一张 CUDA GPU；`device="auto"` 在 CUDA 不可用时使用 CPU。完整默认值见 [Config](../ts_benchmark/baselines/self_impl/ASEI/asei.py)，实现版本为 `asei-finite-bank-scan-3.4`。默认 `training_profile="original"` 使用方案规定的容量与预算；`"extended"` 使用下文的容量选择和较长训练预算。两者分别报告，不能混记为同一训练配置。
 
 ## 服务器运行
 
-以下命令在 TAB 仓库根目录执行。先安装服务器 CUDA 环境配套的 PyTorch；其余运行和验收依赖列在 [requirements-asei.txt](../requirements-asei.txt)，不要求替换已有锁定版本。
+以下命令在 TAB 仓库根目录执行，显式启用适用于 SWaT 容量与预算检验的 `extended` 配置。先安装服务器 CUDA 环境配套的 PyTorch；其余运行和验收依赖列在 [requirements-asei.txt](../requirements-asei.txt)，不要求替换已有锁定版本。
 
 ```bash
 mkdir -p log
@@ -13,13 +13,14 @@ nohup uv run python -u ./scripts/run_benchmark.py \
   --config-path unfixed_detect_label_multi_config.json \
   --model-name self_impl.ASEI \
   --data-name-list SWAT.csv \
-  --model-hyper-params '{"device":"auto","seed":42,"lr":0.001,"num_epochs":20,"win_size":63,"alpha":0.01,"frozen_evidence_backend":"canonical","checkpoint_dir":"result/asei_checkpoints/SWAT_label_seed42_v33"}' \
+  --model-hyper-params '{"device":"auto","seed":42,"training_profile":"extended","win_size":63,"alpha":0.01,"frozen_evidence_backend":"canonical","checkpoint_dir":"result/asei_checkpoints/SWAT_label_seed42_extended_v34"}' \
   --seed 42 \
   --eval-backend sequential \
   --gpus 1 \
   --num-workers 1 \
-  --save-path label/ASEI_SWaT_seed42_v33 \
-  > ./log/asei_swat_label_seed42_v33.log 2>&1 &
+  --report-method csv \
+  --save-path label/ASEI_SWaT_seed42_extended_v34 \
+  > ./log/asei_swat_label_seed42_extended_v34.log 2>&1 &
 ```
 
 另一个评测入口：
@@ -29,18 +30,19 @@ nohup uv run python -u ./scripts/run_benchmark.py \
   --config-path unfixed_detect_score_multi_config.json \
   --model-name self_impl.ASEI \
   --data-name-list SWAT.csv \
-  --model-hyper-params '{"device":"auto","seed":42,"lr":0.001,"num_epochs":20,"win_size":63,"alpha":0.01,"frozen_evidence_backend":"canonical","checkpoint_dir":"result/asei_checkpoints/SWAT_score_seed42_v33"}' \
+  --model-hyper-params '{"device":"auto","seed":42,"training_profile":"extended","win_size":63,"alpha":0.01,"frozen_evidence_backend":"canonical","checkpoint_dir":"result/asei_checkpoints/SWAT_score_seed42_extended_v34"}' \
   --seed 42 \
   --eval-backend sequential \
   --gpus 1 \
   --num-workers 1 \
-  --save-path score/ASEI_SWaT_seed42_v33 \
-  > ./log/asei_swat_score_seed42_v33.log 2>&1 &
+  --report-method csv \
+  --save-path score/ASEI_SWaT_seed42_extended_v34 \
+  > ./log/asei_swat_score_seed42_extended_v34.log 2>&1 &
 ```
 
 `--gpus 1` 将物理 GPU1 映射为逻辑 `cuda:0`。CPU 可显式指定 JSON `"device":"cpu"`。TAB 的 `--seed` 与模型 JSON 的 `seed` 在上述命令中均为 42；模型独立使用 JSON 的种子，默认是 2026。两个评测进程各自训练一遍。
 
-CUDA 拟合在重置峰值显存统计前，先显式初始化 PyTorch CUDA 运行时并选定逻辑设备；CPU 路径不调用这些 CUDA API。启动日志包含 `ASEI CUDA startup implementation=asei-finite-bank-scan-3.3`。这一初始化顺序适用于尚未创建 CUDA 张量的新进程，避免在分配器尚未注册设备时调用 `reset_peak_memory_stats`。CUDA 初始化错误直接报告，不跳过错误继续训练。
+CUDA 拟合在重置峰值显存统计前，先显式初始化 PyTorch CUDA 运行时并选定逻辑设备；CPU 路径不调用这些 CUDA API。启动日志包含 `ASEI CUDA startup implementation=asei-finite-bank-scan-3.4`。这一初始化顺序适用于尚未创建 CUDA 张量的新进程，避免在分配器尚未注册设备时调用 `reset_peak_memory_stats`。CUDA 初始化错误直接报告，不跳过错误继续训练。
 
 原始两个 TAB 配置保持 `metrics="all"`：label 评测及报告包含全部 16 个原有指标，score 包含全部 6 个原有指标。VUS_ROC/PR 在一次评测内共用曲线计算，数值和指标定义不变。
 
@@ -49,6 +51,7 @@ CUDA 拟合在重置峰值显存统计前，先显式初始化 PyTorch CUDA 运�
 ```bash
 ASEI_GPU=1 ASEI_SEED=42 bash scripts/run_asei.sh label --data-name-list SWAT.csv
 ASEI_GPU=1 ASEI_SEED=42 bash scripts/run_asei.sh score --data-name-list SWAT.csv
+ASEI_GPU=1 ASEI_SEED=42 ASEI_TRAINING_PROFILE=extended bash scripts/run_asei.sh label --data-name-list SWAT.csv
 ```
 
 `ASEI_HYPER_PARAMS` 可以替换脚本默认 JSON；替换时应显式保留所需的模型 `seed`。TAB 的 `--num-workers` 控制实体任务，模型 JSON 的 `num_workers` 控制 DataLoader，默认 0。
@@ -77,7 +80,7 @@ F 至少有 256 个有效预测目标；Cfit 至少有 64 个校正目标；Rref
 
 ## 模型与训练预算
 
-容量仅由 F 长度解析；显式提供的配置覆盖自动值。
+`original` 容量由 F 长度解析；显式提供的配置覆盖自动值。
 
 | 条件 | hidden_dim | predictor_block_size Q | batch_size Bp | auxiliary_train_pairs |
 |---|---:|---:|---:|---:|
@@ -97,9 +100,32 @@ F 至少有 256 个有效预测目标；Cfit 至少有 64 个校正目标；Rref
 
 校正器按通道和分支估计 `scale=max(mean(d),IQR(d),1e-4)`，在 y=d/scale 上训练。beta 初始为零，截距为全部 y 的中位数；共享 MLP 为 P→8→1，输出层零初始化，eta=0.1×IQR(y)。两阶段批量至多 2048 个时刻，固定种子排列、尾批保留。最终 r=scale×(y−y_hat)，不对 y_hat 截断。日志保存更新数、处理样本数、首末损失和最大 beta L1 范数；固定预算不等同于精确收敛。
 
+### 扩展训练配置
+
+`training_profile="extended"` 使用以下明确预算。模型的因果结构、校正与证据公式、八参数评分器、固定验证协议、独立参考及阈值规则与 `original` 相同，容量与优化过程属于单独的训练配置。
+
+| 项目 | extended 设置 |
+|---|---|
+| 预测器容量 | `hidden_dim_candidates=[32,64,128]`，各自完整训练；以正常 Vsel Huber 最小的检查点选宽度，完全同分优先较早轮次，再按候选顺序 |
+| 预测器预算 | AdamW，初始 lr=3e-4，weight_decay=1e-4；最多60轮，至少10轮，早停 patience=12，梯度范数裁剪1 |
+| 预测器学习率 | Vsel 连续4轮未改善后乘0.5（ReduceLROnPlateau patience=3），最低1e-5 |
+| 连续目标批量 | 4块，每块256目标；SWaT 每轮310次更新，仍覆盖全部316722个有效目标 |
+| 校正器 | 线性与非线性各20个完整 Cfit 数据遍历，尾批保留；lr 分别为1e-2、1e-3，其他定义相同；SWaT 每阶段400次更新 |
+| 有限训练库 | 1536对；固定验证库仍48对、6组等权 |
+| 评分器预算 | 最多100轮，至少10轮，patience=15；门控与动态参数 lr=3e-3，训练偏置 lr=3e-2，梯度范数裁剪1 |
+| 评分学习率 | 固定 Vsel 任务连续6轮未改善后两组 lr 同乘0.5（patience=5）；最低分别为1e-5、1e-4 |
+
+宽度32/64/128在51通道下分别有10886/37542/140006个预测器参数。深度、W=63和图滞后保持一致；参数跨通道共享。文献及本地检查支持这一候选范围，尚无真实 SWaT 扩展训练结果可以认定哪一档最优。容量只由 Vsel 正常预测误差选择；这个代理目标不能保证真实异常检测排序最优。每个实体重新选择，Vcal 和测试均不参与。
+
+JSON 显式参数优先于 profile：例如 `"hidden_dim":64` 固定宽度并停用 profile 的容量搜索；显式 `"hidden_dim_candidates":[64,128]` 改变候选集合。`lr` 仅覆盖预测器学习率，`num_epochs` 仅覆盖预测器最大轮数。若希望使用扩展配置的60轮，不要保留旧命令里的 `"num_epochs":20`。显式 `corrector_linear_steps` / `corrector_nonlinear_steps` 停用相应阶段的 profile 整轮预算；也可直接设置 `corrector_linear_epochs` / `corrector_nonlinear_epochs`。所有实际参数及各候选历史写入 checkpoint。
+
+`training_bias` 只进入训练分类 logit，单独学习率用于适配其无界分数尺度；它不是部署阈值，也不改变原始分数公式。学习率调度与早停仅读取 Vsel；恢复其最优检查点后才建立阈值。校正器另外记录阶段前后相同全 Cfit 目标上的 Huber，避免把不同随机批的首末损失误当作收敛证据；该统计不是独立验证性能。
+
+正常 F 和 Vsel 的全量证据在缓存构建时各计算一次，并复用来记录逐通道中心化证据均值与饱和比例；不增加评分 epoch 的提取器调用。若正常数据持续达到证据上限，应结合参考覆盖分析，不能仅凭更宽网络或更低预测损失解释误报。详细文献与日志依据见 [训练分析](ASEI_training_analysis.md)。
+
 独立参考保存全部 d/r 的 FP32 排序值。尾部查询使用左插入位置，把相等值计入上尾；两个预测分支先取最大证据，再中心化。参考自查询使用同一路径，均值 FP64 累积、中心保存 FP32。记录参考点数及 log(Nref+1)。
 
-冻结前端默认使用 `frozen_evidence_backend="canonical"`：每次预测或校正调用的序列批量固定为1，时间计算形状固定。默认每次1035个预测计算位置、1031个校正计算位置，包含1024个完整分数所需的误差和滚动历史。尾部只补齐未使用的未来计算槽，输出立即截取真实目标；不足的历史不补造，真实训练目标、参考样本和阈值样本数量均保持原值。训练预测器的块批量8、训练校正器的批量2048及其梯度公式不受该冻结策略影响。
+冻结前端默认使用 `frozen_evidence_backend="canonical"`：每次预测或校正调用的序列批量固定为1，时间计算形状固定。默认每次1035个预测计算位置、1031个校正计算位置，包含1024个完整分数所需的误差和滚动历史。尾部只补齐未使用的未来计算槽，输出立即截取真实目标；不足的历史不补造，真实训练目标、参考样本和阈值样本数量均保持原值。预测器训练使用所选profile的块批量，校正器训练批量2048；冻结计算形状不改变训练梯度公式。
 
 所有冻结提取阶段，包括校正拟合所用误差、独立参考、两路配对任务、校准和部署，使用相同计算形状及FP32数值策略，避免改变GPU批量/时间维度后，微小舍入误差在经验分布的重复值处放大为整幅证据。每次拟合在建立参考后、评分训练前进行切片及批量证据一致性预检，最大差超过1e-5时明确停止。尾部仍严格左插入查询，不添加epsilon、合并近似相等值或降低参考精度。
 
@@ -121,7 +147,7 @@ lengths = 去重并排序 min(Lcap, l)，l ∈ {1,max(1,T0/4),T0,4*T0,16*T0}
 
 Npre<0 或 Lcap<1 时报错。单事件与等长双事件再发布局等权；双事件间隔 G，共享通道组，独立抽取启动延迟和扰动参数。事件前包含 D 点原始预热和 Npre 次正常状态更新，之后有 Nrec 点恢复。3604 点输入的默认划分产生 Vsel=360、Vcal=361；T0=8 时 Npre=33、Lcap=54，最长双事件轨迹359点。
 
-训练库默认96/384对，验证库固定48对。三种扰动族与两种布局均衡分配，子类型均衡、事件长度循环分配。验证专用种子固定任务；训练一半均匀取位置，一半从16个候选位置正常强度最高四分位抽取。困难度查 F 正常证据前缀和。错位扰动从原始正常副本读取过去值，事件首末点必须改变；确定性重试最多128次，局部常值时重新取有效基础位置，无法构造则报错。
+original训练库默认96/384对，extended为1536对，验证库固定48对。三种扰动族与两种布局均衡分配，子类型均衡、事件长度循环分配。验证专用种子固定任务；训练一半均匀取位置，一半从16个候选位置正常强度最高四分位抽取。困难度查 F 正常证据前缀和。错位扰动从原始正常副本读取过去值，事件首末点必须改变；确定性重试最多128次，局部常值时重新取有效基础位置，无法构造则报错。
 
 F、Vsel 正常证据各顺序计算一次。所有扰动在观测空间施加，然后经过完整冻结模型。缓存形状为 [2,Lraw−H−P,C,2]，包含首完整分数之前的 R−1 个证据，视角顺序为校正/状态。按批使用 avg_pool1d 生成滚动均值，避免长序列 FP32 累加和相减。评分训练只读取缓存，不调用预测器、校正器或 searchsorted。
 
@@ -154,6 +180,7 @@ F、Vsel 正常证据各顺序计算一次。所有扰动在观测空间施加�
 ```powershell
 & 'E:\Miniconda3\Scripts\conda.exe' run -n codex python -B -m pytest tests -q
 & 'E:\Miniconda3\Scripts\conda.exe' run -n codex python -B scripts/validate_asei.py --device cpu --output docs/ASEI_validation.json
+& 'E:\Miniconda3\Scripts\conda.exe' run -n codex python -B scripts/validate_asei.py --training-profile extended --device cpu --output docs/ASEI_extended_validation.json
 ```
 
 服务器单卡正确性及小规模计时：
@@ -161,7 +188,9 @@ F、Vsel 正常证据各顺序计算一次。所有扰动在观测空间施加�
 ```bash
 uv run python -B scripts/check_asei_runtime.py --gpus 1 --device auto --channels 51 --batch-size 8 --block-sizes 128 256
 uv run python -B scripts/check_asei_runtime.py --gpus 1 --device auto --channels 51 --frozen-only
-CUDA_VISIBLE_DEVICES=1 uv run python -B -m pytest tests/test_asei_core.py tests/test_asei.py tests/test_asei_audit.py tests/test_asei_frozen_numerics.py -q
+uv run python -B scripts/check_asei_runtime.py --gpus 1 --device auto --channels 51 --hidden-dim 64 --frozen-only
+uv run python -B scripts/check_asei_runtime.py --gpus 1 --device auto --channels 51 --hidden-dim 128 --frozen-only
+CUDA_VISIBLE_DEVICES=1 uv run python -B -m pytest tests/test_asei_core.py tests/test_asei.py tests/test_asei_audit.py tests/test_asei_frozen_numerics.py tests/test_asei_training.py -q
 ```
 
 测试包含顺序/扫描前向和全部一阶梯度、ReLU零点和通道并列、跨块梯度、长10000点FP32误差、预测因果性、尾块覆盖、参考并列、L1投影、任务重建、缓存损坏、Vcal隔离、流式缺失填充、保存重载以及TAB全部指标和CSV报告。小规模测量见 [ASEI_validation.json](ASEI_validation.json)，不代表完整数据集精度或服务器加速结果。

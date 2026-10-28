@@ -24,12 +24,14 @@ def normal_series(length,seed):
     return pd.DataFrame(x,columns=["a","b","c"])
 
 
-def validate(output,device="auto"):
+def validate(output,device="auto",training_profile="original"):
     torch.set_num_threads(2)
     overrides = dict(predictor_epochs=1,corrector_linear_steps=3,corrector_nonlinear_steps=3,score_epochs=2,
-                     auxiliary_train_pairs=12,auxiliary_validation_pairs=48,device=device)
+                     auxiliary_train_pairs=12,auxiliary_validation_pairs=48,device=device,
+                     training_profile=training_profile)
     report = dict(implementation_version=IMPLEMENTATION_VERSION,
                   scope="Synthetic implementation verification only; no complete benchmark or detection-quality claim.",
+                  preset_configuration=asdict(ASEI(training_profile=training_profile,device=device).config),
                   official_configuration=asdict(Config()),smoke_overrides=overrides,
                   cuda_available=torch.cuda.is_available(),entities=[])
     previous = None
@@ -78,5 +80,6 @@ if __name__=="__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output",default="result/asei_validation/summary.json")
     parser.add_argument("--device",default="auto")
+    parser.add_argument("--training-profile",choices=["original","extended"],default="original")
     args = parser.parse_args()
-    validate(args.output,args.device)
+    validate(args.output,args.device,args.training_profile)

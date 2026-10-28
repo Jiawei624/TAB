@@ -37,9 +37,14 @@ def infer_point_rates(accuracy, precision, recall):
 
 def audit_supplied_run(log_path,metrics_path):
     text = log_path.read_text(encoding="utf-8-sig")
-    predictor = [dict(epoch=int(epoch),training_huber=float(train),validation_huber=float(valid))
-                 for epoch,train,valid in re.findall(
-                     r"ASEI predictor epoch=(\d+) train=([\deE.+-]+) Vsel=([\deE.+-]+)",text)]
+    predictor = []
+    for epoch,train,valid,extra in re.findall(
+            r"ASEI predictor epoch=(\d+) train=([\deE.+-]+) Vsel=([\deE.+-]+)([^\n]*)",text):
+        row = dict(epoch=int(epoch),training_huber=float(train),validation_huber=float(valid))
+        width = re.search(r"hidden=(\d+)",extra)
+        if width:
+            row["hidden_dim"] = int(width.group(1))
+        predictor.append(row)
     scorer = [dict(epoch=int(epoch),validation_loss=float(loss),decay=float(decay),kappa=float(kappa))
               for epoch,loss,decay,kappa in re.findall(
                   r"ASEI scorer epoch=(\d+) Vsel_loss=([\deE.+-]+) lambda=([\deE.+-]+) kappa=([\deE.+-]+)",text)]
@@ -61,6 +66,18 @@ def audit_supplied_run(log_path,metrics_path):
     if predictor:
         result["predictor_best_epoch_from_log"] = min(predictor,key=lambda row:(row["validation_huber"],row["epoch"]))["epoch"]
         result["predictor_actual_epochs_from_log"] = predictor[-1]["epoch"]
+        widths = sorted({row["hidden_dim"] for row in predictor if "hidden_dim" in row})
+        if widths:
+            result["predictor_by_capacity"] = {
+                str(width):[row for row in predictor if row.get("hidden_dim")==width] for width in widths}
+            result["predictor_total_epochs_all_candidates"] = len(predictor)
+            chosen = re.search(r"ASEI predictor selected hidden=(\d+) parameters=\d+ best_epoch=(\d+)",text)
+            if chosen:
+                width,epoch = map(int,chosen.groups())
+                result["predictor_selected_hidden_dim_from_log"] = width
+                result["predictor_best_epoch_from_log"] = epoch
+                result["predictor_actual_epochs_from_log"] = max(
+                    row["epoch"] for row in predictor if row.get("hidden_dim")==width)
     if scorer:
         result["scorer_best_is_last"] = min(scorer,key=lambda row:(row["validation_loss"],row["epoch"]))["epoch"]==scorer[-1]["epoch"]
         result["scorer_validation_still_decreasing"] = len(scorer)>1 and scorer[-1]["validation_loss"]<scorer[-2]["validation_loss"]

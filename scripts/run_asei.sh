@@ -11,9 +11,14 @@ fi
 
 seed="${ASEI_SEED:-2026}"
 gpu="${ASEI_GPU:-1}"
+profile="${ASEI_TRAINING_PROFILE:-original}"
+if [[ "$profile" != "original" && "$profile" != "extended" ]]; then
+    echo "ASEI_TRAINING_PROFILE must be original or extended" >&2
+    exit 2
+fi
 hyper_params="${ASEI_HYPER_PARAMS:-}"
 if [[ -z "$hyper_params" ]]; then
-    hyper_params="{\"device\":\"auto\",\"seed\":${seed},\"lr\":0.001,\"num_epochs\":20,\"win_size\":63,\"alpha\":0.01,\"frozen_evidence_backend\":\"canonical\",\"checkpoint_dir\":\"result/asei_checkpoints/v33\"}"
+    hyper_params="{\"device\":\"auto\",\"seed\":${seed},\"training_profile\":\"${profile}\",\"win_size\":63,\"alpha\":0.01,\"frozen_evidence_backend\":\"canonical\",\"checkpoint_dir\":\"result/asei_checkpoints/v34/${profile}\"}"
 fi
 
 # CUDA_VISIBLE_DEVICES is set by TAB before CUDA initialization:
@@ -24,4 +29,4 @@ exec "${ASEI_PYTHON:-python}" -B scripts/run_benchmark.py \
     --model-hyper-params "$hyper_params" \
     --gpus "$gpu" --eval-backend sequential --num-workers 1 \
     --seed "$seed" --report-method csv \
-    --save-path "${mode}/ASEI/v33/seed${seed}" "$@"
+    --save-path "${mode}/ASEI/v34/${profile}/seed${seed}" "$@"
