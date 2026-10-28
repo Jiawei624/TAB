@@ -1,0 +1,259 @@
+{
+  "audit_runtime_version": "asei-finite-bank-scan-3.2",
+  "scope": "Read-only diagnosis. No training, model selection or threshold update.",
+  "cuda_available": false,
+  "supplied_run": {
+    "log_file": "..\\asei_swat_label_seed42.log",
+    "metric_file": "..\\test_report.1793159611.user.3901340.csv.csv",
+    "predictor_history": [
+      {
+        "epoch": 1,
+        "training_huber": 0.0951068,
+        "validation_huber": 0.05778205
+      },
+      {
+        "epoch": 2,
+        "training_huber": 0.05895714,
+        "validation_huber": 0.04375717
+      },
+      {
+        "epoch": 3,
+        "training_huber": 0.04263749,
+        "validation_huber": 0.03490767
+      },
+      {
+        "epoch": 4,
+        "training_huber": 0.03450868,
+        "validation_huber": 0.0334874
+      },
+      {
+        "epoch": 5,
+        "training_huber": 0.03162669,
+        "validation_huber": 0.02861564
+      },
+      {
+        "epoch": 6,
+        "training_huber": 0.02980037,
+        "validation_huber": 0.02848033
+      },
+      {
+        "epoch": 7,
+        "training_huber": 0.02845101,
+        "validation_huber": 0.02610696
+      },
+      {
+        "epoch": 8,
+        "training_huber": 0.02847821,
+        "validation_huber": 0.02505513
+      },
+      {
+        "epoch": 9,
+        "training_huber": 0.02720344,
+        "validation_huber": 0.02551439
+      },
+      {
+        "epoch": 10,
+        "training_huber": 0.0267138,
+        "validation_huber": 0.02449501
+      },
+      {
+        "epoch": 11,
+        "training_huber": 0.02591691,
+        "validation_huber": 0.02186664
+      },
+      {
+        "epoch": 12,
+        "training_huber": 0.02560093,
+        "validation_huber": 0.02200496
+      },
+      {
+        "epoch": 13,
+        "training_huber": 0.0252689,
+        "validation_huber": 0.01931489
+      },
+      {
+        "epoch": 14,
+        "training_huber": 0.02519518,
+        "validation_huber": 0.01914982
+      },
+      {
+        "epoch": 15,
+        "training_huber": 0.02499814,
+        "validation_huber": 0.02143195
+      },
+      {
+        "epoch": 16,
+        "training_huber": 0.02524569,
+        "validation_huber": 0.01951175
+      },
+      {
+        "epoch": 17,
+        "training_huber": 0.02481135,
+        "validation_huber": 0.02041654
+      },
+      {
+        "epoch": 18,
+        "training_huber": 0.02407421,
+        "validation_huber": 0.02223442
+      }
+    ],
+    "scorer_history": [
+      {
+        "epoch": 1,
+        "validation_loss": 64.106062,
+        "decay": 0.897772,
+        "kappa": 0.020487
+      },
+      {
+        "epoch": 2,
+        "validation_loss": 62.014346,
+        "decay": 0.895534,
+        "kappa": 0.021012
+      },
+      {
+        "epoch": 3,
+        "validation_loss": 60.0191,
+        "decay": 0.89329,
+        "kappa": 0.021577
+      },
+      {
+        "epoch": 4,
+        "validation_loss": 58.130742,
+        "decay": 0.891041,
+        "kappa": 0.022188
+      },
+      {
+        "epoch": 5,
+        "validation_loss": 56.353975,
+        "decay": 0.888792,
+        "kappa": 0.022853
+      },
+      {
+        "epoch": 6,
+        "validation_loss": 54.69773,
+        "decay": 0.886543,
+        "kappa": 0.023571
+      },
+      {
+        "epoch": 7,
+        "validation_loss": 53.134171,
+        "decay": 0.8843,
+        "kappa": 0.024347
+      },
+      {
+        "epoch": 8,
+        "validation_loss": 51.65417,
+        "decay": 0.882063,
+        "kappa": 0.025198
+      },
+      {
+        "epoch": 9,
+        "validation_loss": 50.291997,
+        "decay": 0.879836,
+        "kappa": 0.026114
+      },
+      {
+        "epoch": 10,
+        "validation_loss": 49.002122,
+        "decay": 0.877622,
+        "kappa": 0.027109
+      }
+    ],
+    "stage_seconds": {
+      "graph": 0.449,
+      "predictor": 70.782,
+      "corrector_linear": 0.166,
+      "corrector_nonlinear": 0.342,
+      "reference": 0.757,
+      "bank_build": 2.95,
+      "scorer": 21.272,
+      "calibration": 0.955
+    },
+    "observed_runtime": {
+      "implementation_version": "asei-finite-bank-scan-3.1",
+      "torch": "2.4.1+cu121",
+      "device": "cuda:0"
+    },
+    "loaded_series_count": 1,
+    "splits": {
+      "input_points": 495000,
+      "outer_training_end": 396000,
+      "predictor_end": 316800,
+      "corrector_end": 356400,
+      "training_end": 396000,
+      "validation_points": 99000,
+      "validation_selection_points": 49500,
+      "validation_calibration_points": 49500,
+      "validation_midpoint": 445500,
+      "external_validation": false,
+      "segment_lengths": {
+        "F": 316800,
+        "Cfit": 39600,
+        "Rref": 39600,
+        "Vsel": 49500,
+        "Vcal": 49500
+      }
+    },
+    "selection": {
+      "epoch": 10,
+      "loss": 49.00212152798971,
+      "actual_epochs": 10,
+      "optimizer_steps": 500,
+      "scorer_instances": 1
+    },
+    "calibration": [
+      {
+        "alpha": 0.01,
+        "N": 49411,
+        "K": 494,
+        "threshold": 37.3153076171875,
+        "false_alarm_count": 412,
+        "actual_false_alarm_rate": 0.00833822428204246,
+        "resolution": 2.023840845155937e-05
+      }
+    ],
+    "counters": {
+      "normal_evidence_passes": 2,
+      "changed_trajectory_builds": 432,
+      "score_epoch_feature_extractor_calls": 0
+    },
+    "predictor_best_epoch_from_log": 14,
+    "predictor_actual_epochs_from_log": 18,
+    "scorer_best_is_last": true,
+    "scorer_validation_still_decreasing": true,
+    "reported_models": {
+      "ASEI;{\"alpha\": 0.01, \"checkpoint_dir\": \"result/asei_checkpoints/SWAT_label_seed42\", \"device\": \"auto\", \"lr\": 0.001, \"num_epochs\": 20, \"seed\": 42, \"win_size\": 63}": {
+        "metrics": {
+          "accuracy": 0.257773065818514,
+          "f_score": 0.2338952410666764,
+          "precision": 0.1337013966297291,
+          "recall": 0.9332857325936912,
+          "adjust_accuracy": 0.2649143512498916,
+          "adjust_f_score": 0.2468179882443766,
+          "adjust_precision": 0.1409406795530679,
+          "adjust_recall": 0.9921092620054558,
+          "rrecall": 0.6739835109226219,
+          "rprecision": 0.0460183589717023,
+          "precision_at_k": 0.1337013966297291,
+          "rf": 0.0861542627693388,
+          "affiliation_f": 0.7033780093612105,
+          "affiliation_precision": 0.552202623851933,
+          "affiliation_recall": 0.968530676205933,
+          "add": 31.37142857142857
+        },
+        "inferred_point_rates": {
+          "source": "inferred from accuracy, precision, recall; not raw confusion counts",
+          "assumption": "same binary population and conventional pointwise metrics",
+          "anomaly_prevalence": 0.12140185233341991,
+          "predicted_positive_fraction": 0.84743031523452,
+          "normal_false_positive_rate": 0.8355670911565451,
+          "true_positive_fraction": 0.11330261669322692,
+          "false_positive_fraction": 0.734127698541293,
+          "false_negative_fraction": 0.008099235640192992,
+          "true_negative_fraction": 0.14447044912528706
+        }
+      }
+    },
+    "scope": "Log/configuration arithmetic and supplied measurements; no raw SWAT prediction reconstruction."
+  }
+}

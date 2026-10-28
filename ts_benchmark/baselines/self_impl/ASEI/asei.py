@@ -283,7 +283,7 @@ class ASEI:
         training = optimizer is not None
         self.predictor.train(training)
         total = torch.zeros((),device=self.device)
-        count = 0
+        count,targets_seen = 0,0
         with torch.set_grad_enabled(training), self._progress(
                 f"predictor {'train' if training else 'Vsel'} epoch={epoch}",len(loader)) as progress:
             for step,(history,target,mask) in enumerate(loader,1):
@@ -303,7 +303,14 @@ class ASEI:
                     optimizer.step()
                 total += numerator.detach()
                 count += denominator
+                targets_seen += valid_count
                 progress.update(step)
+        expected = loader.dataset.target_count
+        if targets_seen!=expected:
+            raise RuntimeError(f"ASEI predictor target coverage mismatch: {targets_seen} != {expected}")
+        self._last_predictor_pass = dict(targets_seen=targets_seen,expected_targets=expected,batches=len(loader))
+        logger.info("ASEI predictor coverage epoch=%s split=%s targets=%d/%d batches=%d",
+                    epoch,"F" if training else "Vsel",targets_seen,expected,len(loader))
         value = float((total/count).cpu())
         if not math.isfinite(value):
             raise FloatingPointError("ASEI predictor Huber loss is not finite")
@@ -322,8 +329,11 @@ class ASEI:
         with self._stage("predictor"):
             for epoch in range(1,cfg.predictor_epochs+1):
                 train_loss = self._predictor_loss(train_loader,optimizer,epoch)
+                training_targets = self._last_predictor_pass["targets_seen"]
                 val_loss = self._predictor_loss(valid_loader,epoch=epoch)
-                history.append(dict(epoch=epoch,train_huber=train_loss,validation_huber=val_loss))
+                history.append(dict(epoch=epoch,train_huber=train_loss,validation_huber=val_loss,
+                                    training_targets=training_targets,
+                                    validation_targets=self._last_predictor_pass["targets_seen"]))
                 if val_loss<best_loss:
                     best_loss,best,best_epoch,stale = val_loss,cpu_state(self.predictor),epoch,0
                 else:
@@ -396,6 +406,9 @@ class ASEI:
         self.metadata_["corrector"] = fit_corrector(
             self.corrector,errors.cpu().numpy(),self.config,self.seed,self.device,self._stage,self._progress)
         self._freeze(self.corrector)
+        logger.info("ASEI corrector coverage samples=%d linear=%s nonlinear=%s maximum_beta_l1=%.9g",
+                    self.metadata_["corrector"]["samples"],self.metadata_["corrector"]["corrector_linear"],
+                    self.metadata_["corrector"]["corrector_nonlinear"],self.metadata_["corrector"]["maximum_beta_l1"])
 
     def _fit_reference(self,values):
         with self._stage("reference"):
@@ -405,6 +418,8 @@ class ASEI:
             self.reference = EvidenceReference(self.config.evidence_bound).fit(d,r,self.device)
         self.metadata_["reference"] = dict(points=len(d),first_raw_index=self.history+self.config.ar_order,
                                            maximum_untruncated_evidence=math.log(len(d)+1),dtype="float32")
+        logger.info("ASEI reference coverage points=%d first_raw_index=%d dtype=float32",
+                    len(d),self.history+self.config.ar_order)
 
     def _new_scorer(self):
         cfg = self.config
@@ -482,13 +497,25 @@ class ASEI:
     @torch.no_grad()
     def _validate_bank(self,bank):
         groups = {}
+        components = {}
+        visited = np.zeros(len(bank.entries),dtype=np.int16)
         for indices in bank.batches(self.config.auxiliary_batch_size):
+            visited[indices] += 1
             detection,ranking = self._bank_loss(bank,indices)
             losses = (detection+ranking).cpu().tolist()
-            for index,loss in zip(indices,losses):
+            separate = torch.stack((detection,ranking),-1).cpu().tolist()
+            for index,loss,values in zip(indices,losses,separate):
                 task = bank.entries[index]["task"]
                 groups.setdefault((task.family,task.scenario),[]).append(loss)
+                components.setdefault((task.family,task.scenario),[]).append(values)
+        if not np.all(visited==1):
+            raise RuntimeError("ASEI validation must visit every fixed task exactly once")
         group_means = {f"{key[0]}:{key[1]}":float(np.mean(values)) for key,values in sorted(groups.items())}
+        means = np.mean([np.mean(values,axis=0) for values in components.values()],axis=0)
+        self._last_validation_components = dict(detection=float(means[0]),ranking=float(means[1]),
+                                                 tasks_seen=int(visited.sum()),
+                                                 tasks_per_group={f"{key[0]}:{key[1]}":len(values)
+                                                                  for key,values in sorted(groups.items())})
         return float(np.mean(list(group_means.values()))),group_means
 
     def _fit_scorer(self,fit,validation,scale):
@@ -530,8 +557,11 @@ class ASEI:
                     rng = np.random.default_rng(np.random.SeedSequence([self.seed,60,epoch]))
                     batches = train_bank.batches(cfg.auxiliary_batch_size,rng)
                     total = torch.zeros((),device=self.device)
+                    separate_total = torch.zeros(2,device=self.device)
+                    visited = np.zeros(len(train_bank.entries),dtype=np.int16)
                     with self._progress(f"scorer epoch={epoch}",len(batches)) as progress:
                         for step,indices in enumerate(batches,1):
+                            visited[indices] += 1
                             optimizer.zero_grad(set_to_none=True)
                             detection,ranking = self._bank_loss(train_bank,indices)
                             loss = (detection+ranking).mean()
@@ -540,27 +570,39 @@ class ASEI:
                             optimizer.step()
                             self.scorer.project_()
                             total += loss.detach()*len(indices)
+                            separate_total += torch.stack((detection.detach().sum(),ranking.detach().sum()))
                             steps += 1
                             progress.update(step)
+                    if not np.all(visited==1):
+                        raise RuntimeError("ASEI scorer must visit every cached training task exactly once per epoch")
                     self.scorer.eval()
                     val_loss,groups = self._validate_bank(valid_bank)
                     if not math.isfinite(val_loss):
                         raise FloatingPointError("ASEI scorer validation loss is nonfinite")
-                    history.append(dict(epoch=epoch,training_loss=float((total/len(train_tasks)).cpu()),
-                                        validation_loss=val_loss,groups=groups))
+                    parts = (separate_total/len(train_tasks)).cpu().tolist()
+                    row = dict(epoch=epoch,training_loss=float((total/len(train_tasks)).cpu()),
+                               training_detection=parts[0],training_ranking=parts[1],
+                               training_tasks_seen=int(visited.sum()),validation_loss=val_loss,groups=groups)
+                    if hasattr(self,"_last_validation_components"):
+                        row["validation_components"] = copy.deepcopy(self._last_validation_components)
+                    history.append(row)
                     if val_loss<best_loss:
                         best_loss,best,best_epoch,stale = val_loss,cpu_state(self.scorer),epoch,0
                     else:
                         stale += 1
-                    logger.info("ASEI scorer epoch=%d Vsel_loss=%.8g lambda=%.6f kappa=%.6f",
-                                epoch,val_loss,float(self.scorer.decay.detach().cpu()),float(self.scorer.kappa.detach().cpu()))
+                    logger.info("ASEI scorer epoch=%d Vsel_loss=%.8g lambda=%.6f kappa=%.6f "
+                                "train_det=%.8g train_rank=%.8g train_tasks=%d/%d validation_components=%s",
+                                epoch,val_loss,float(self.scorer.decay.detach().cpu()),float(self.scorer.kappa.detach().cpu()),
+                                parts[0],parts[1],int(visited.sum()),len(train_tasks),row.get("validation_components"))
                     if epoch>=min(cfg.score_min_epochs,cfg.score_epochs) and stale>=cfg.score_patience:
                         break
             self.metadata_["counters"]["score_epoch_feature_extractor_calls"] = self._extractor_calls-calls_before
             self.scorer.load_state_dict(best)
             self._freeze(self.scorer)
             self.metadata_["selection"] = dict(epoch=best_epoch,loss=best_loss,actual_epochs=epoch,
-                                                optimizer_steps=steps,scorer_instances=1)
+                                                optimizer_steps=steps,scorer_instances=1,
+                                                reached_epoch_limit=epoch==cfg.score_epochs,
+                                                best_at_epoch_limit=best_epoch==epoch==cfg.score_epochs)
             self.metadata_["selection_history"] = history
             self.metadata_["decay"] = float(self.scorer.decay.cpu())
             self.metadata_["kappa"] = float(self.scorer.kappa.cpu())
@@ -589,6 +631,9 @@ class ASEI:
     def _calibrate(self,validation):
         with self._stage("calibration"):
             self.validation_scores_ = self._output_scores(self._sequence_scores(validation))
+            expected = max(0,len(validation)-self.raw_history)
+            if len(self.validation_scores_)!=expected:
+                raise RuntimeError("ASEI calibration dropped valid normal timestamps")
             self.thresholds_,records = {},[]
             for alpha in self.alphas:
                 threshold,count = empirical_threshold(self.validation_scores_,alpha)
@@ -597,6 +642,7 @@ class ASEI:
                 records.append(dict(alpha=alpha,N=n,K=int(np.floor(alpha*n)),threshold=threshold,
                                     false_alarm_count=count,actual_false_alarm_rate=count/n,resolution=1/n))
         self.metadata_["calibration"] = records
+        logger.info("ASEI calibration coverage ready_scores=%d/%d records=%s",len(self.validation_scores_),expected,records)
 
     def detect_fit(self,train_data,train_label=None,valid_data=None):
         self._fitted = False
@@ -653,6 +699,15 @@ class ASEI:
         self._fit_reference(parts["Rref"])
         self._fit_scorer(parts["F"],parts["Vsel"],scale)
         self._calibrate(parts["Vcal"])
+        self.metadata_["data_coverage"] = dict(
+            predictor_targets_per_epoch=len(parts["F"])-self.history,
+            predictor_validation_targets_per_epoch=len(parts["Vsel"])-self.history,
+            corrector_valid_targets=len(parts["Cfit"])-self.history-cfg.ar_order,
+            independent_reference_points=self.metadata_["reference"]["points"],
+            calibration_ready_scores=len(self.validation_scores_),
+            auxiliary_training_pairs=len(self.metadata_["training_tasks"]),
+            auxiliary_validation_pairs=len(self.metadata_["validation_tasks"]),
+            graph_statistic_targets=self.metadata_["predictor"]["graph_targets"])
         self.metadata_["parameters"] = {name:sum(p.numel() for p in module.parameters()) for name,module in
                                         (("predictor",self.predictor),("corrector",self.corrector),("scorer",self.scorer))}
         self.metadata_["total_fit_seconds"] = time.perf_counter()-started
@@ -662,7 +717,8 @@ class ASEI:
         logger.info("ASEI selected=%s calibration=%s counters=%s",self.metadata_["selection"],
                     self.metadata_["calibration"],self.metadata_["counters"])
         if cfg.checkpoint_dir:
-            config_hash = hashlib.sha256(json.dumps(asdict(cfg),sort_keys=True).encode()).hexdigest()[:8]
+            signature = dict(implementation_version=IMPLEMENTATION_VERSION,config=asdict(cfg))
+            config_hash = hashlib.sha256(json.dumps(signature,sort_keys=True).encode()).hexdigest()[:8]
             path = Path(cfg.checkpoint_dir)/f"asei_seed{self.seed}_{digest.hexdigest()[:16]}_{config_hash}.pt"
             self.save(path)
             logger.info("ASEI checkpoint=%s",path)

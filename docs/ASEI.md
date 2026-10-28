@@ -1,6 +1,6 @@
 # ASEI 运行与配置
 
-实现依据工作区的 [In1_1_4.md](../../In1_1_4.md) 和 [impl.md](../../impl.md)，TAB 入口为 `self_impl.ASEI`。每个文件分别拟合预测器、校正器、评分器和阈值。模型使用一张 CUDA GPU；`device="auto"` 在 CUDA 不可用时使用 CPU。完整默认值见 [Config](../ts_benchmark/baselines/self_impl/ASEI/asei.py)，实现版本为 `asei-finite-bank-scan-3.1`。
+实现依据工作区的 [In1_1_4.md](../../In1_1_4.md) 和 [impl.md](../../impl.md)，TAB 入口为 `self_impl.ASEI`。每个文件分别拟合预测器、校正器、评分器和阈值。模型使用一张 CUDA GPU；`device="auto"` 在 CUDA 不可用时使用 CPU。完整默认值见 [Config](../ts_benchmark/baselines/self_impl/ASEI/asei.py)，实现版本为 `asei-finite-bank-scan-3.2`。
 
 ## 服务器运行
 
@@ -40,7 +40,7 @@ nohup uv run python -u ./scripts/run_benchmark.py \
 
 `--gpus 1` 将物理 GPU1 映射为逻辑 `cuda:0`。CPU 可显式指定 JSON `"device":"cpu"`。TAB 的 `--seed` 与模型 JSON 的 `seed` 在上述命令中均为 42；模型独立使用 JSON 的种子，默认是 2026。两个评测进程各自训练一遍。
 
-CUDA 拟合在重置峰值显存统计前，先显式初始化 PyTorch CUDA 运行时并选定逻辑设备；CPU 路径不调用这些 CUDA API。启动日志包含 `ASEI CUDA startup implementation=asei-finite-bank-scan-3.1`。这一初始化顺序适用于尚未创建 CUDA 张量的新进程，避免在分配器尚未注册设备时调用 `reset_peak_memory_stats`。CUDA 初始化错误直接报告，不跳过错误继续训练。
+CUDA 拟合在重置峰值显存统计前，先显式初始化 PyTorch CUDA 运行时并选定逻辑设备；CPU 路径不调用这些 CUDA API。启动日志包含 `ASEI CUDA startup implementation=asei-finite-bank-scan-3.2`。这一初始化顺序适用于尚未创建 CUDA 张量的新进程，避免在分配器尚未注册设备时调用 `reset_peak_memory_stats`。CUDA 初始化错误直接报告，不跳过错误继续训练。
 
 原始两个 TAB 配置保持 `metrics="all"`：label 评测及报告包含全部 16 个原有指标，score 包含全部 6 个原有指标。VUS_ROC/PR 在一次评测内共用曲线计算，数值和指标定义不变。
 
@@ -69,7 +69,7 @@ TAB 依据 `DETECT_META.csv` 的 `train_lens` 保留官方训练/测试边界。
 
 若调用 `detect_fit(..., valid_data=...)`，整个训练输入作为建模部分，内部仍为 80%/10%/10%；外部验证输入平分为 Vsel/Vcal。所有片段独立预热。
 
-F 的逐列有限值中位数作为因果填充初值，全缺失列初值为零并记录。NaN/±Inf 前向填充；独立片段重置填充历史。均值、总体标准差仅从填充后的 F 估计，常量列标准差置为 1 并保留。流式调用延续最后有限原始值，不使用后向填充。
+F 的逐列有限值中位数作为因果填充初值，全缺失列初值为零并记录。NaN/±Inf 前向填充；独立片段重置填充历史。均值、总体标准差仅从填充后的 F 估计，常量列标准差置为 1 并保留。以原始填充值是否完全相同判断常量，避免归约舍入产生伪小方差；常量均值精确取该常量，真实非零小方差保留原尺度。流式调用延续最后有限原始值，不使用后向填充。
 
 默认 W=63，最大图滞后 16，H=W+16−1=78，AR 阶数 P=4，滚动长度 R=8。首预测索引为 H，首校正/参考索引为 H+P=82，首完整分数索引 D=H+P+R−1=89。参考段不额外扣除 R−1。
 
@@ -137,7 +137,13 @@ F、Vsel 正常证据各顺序计算一次。所有扰动在观测空间施加�
 
 默认输出原始带符号分数。`score_transform="bounded"` 显式启用固定理论界的线性变换；默认界为 [−6.2,299.5]，阈值同时变换，不使用测试 min/max。
 
-`save/load` 使用 format_version=3，保存完整解析配置、预处理、列序、三个模型、参考、任务描述、种子、阈值和运行元数据。加载不重新估计统计量，模型冻结、流状态清空。旧格式模型需要重新拟合；临时证据库不属于 checkpoint 的运行依赖。
+`save/load` 使用 format_version=3，保存完整解析配置、预处理、列序、三个模型、参考、任务描述、种子、阈值和运行元数据。加载不重新估计统计量，模型冻结、流状态清空。旧格式模型需要重新拟合；临时证据库不属于 checkpoint 的运行依赖。自动保存文件名摘要包含实现版本，比较不同实现时同时使用独立的结果目录和日志名。
+
+## 数据覆盖与冻结模型诊断
+
+日志和checkpoint记录预测器每轮F/Vsel有效目标数、校正器实际访问次数和不同样本数、参考点数、评分器每轮任务覆盖及判别/排序损失分量。每轮预测和评分任务覆盖、最终校准分数数量有显式断言。增加训练预算时须记录实际配置，默认值不根据测试指标自动调整。
+
+`scripts/audit_asei.py` 支持只解析已有日志及指标，也支持读取checkpoint和同一TAB数据版本，检查预处理、证据、通道主导情况和校准重现。它核验数据指纹，不训练或修改保存的阈值。真实SWAT运行的完整核对与命令见 [ASEI_SWAT_audit.md](ASEI_SWAT_audit.md)，解析结果见 [ASEI_SWAT_audit.json](ASEI_SWAT_audit.json)。
 
 ## 小规模验收
 

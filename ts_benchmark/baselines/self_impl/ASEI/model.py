@@ -200,11 +200,15 @@ class EvidenceScorer(nn.Module):
     def kappa(self):
         return self.kappa_min + (self.kappa_max - self.kappa_min) * self.kappa_logit.sigmoid()
 
-    def integrate(self, features, state=None):
-        # features: independent sequences, time, channels, [ec, es, mean_ec, mean_es].
+    def fuse(self,features):
+        """Equation (13), also exposed to read-only channel diagnostics."""
         omega = self.omega_min + (1 - 2 * self.omega_min) * torch.sigmoid(
             (features / self.bound * self.gate_weight).sum(-1) + self.gate_bias)
-        evidence = omega * features[..., 0] + (1 - omega) * features[..., 1]
+        return omega * features[..., 0] + (1 - omega) * features[..., 1]
+
+    def integrate(self, features, state=None):
+        # features: independent sequences, time, channels, [ec, es, mean_ec, mean_es].
+        evidence = self.fuse(features)
         if state is None:
             state = evidence.new_zeros((evidence.shape[0], evidence.shape[2]))
         return integrate(evidence, self.decay, state, self.kappa, self.recurrence_backend, self.scan_chunk_size)

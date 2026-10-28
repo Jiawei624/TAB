@@ -31,8 +31,11 @@ class CausalPreprocessor:
         filled, _ = self.fill(values)
         self.mean = filled.mean(0, dtype=np.float64)
         self.scale = filled.std(0, dtype=np.float64)
-        self.constant = self.scale == 0
-        self.scale[self.constant] = 1
+        # A repeated decimal can have a small nonzero std solely from the mean
+        # reduction's rounding error. Detect actual constants from their range.
+        self.constant = np.all(filled == filled[:1], axis=0)
+        self.mean[self.constant] = filled[0,self.constant]
+        self.scale[self.constant | (self.scale==0)] = 1
         return self
 
     def fill(self, values, previous=None):

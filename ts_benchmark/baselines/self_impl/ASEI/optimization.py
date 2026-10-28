@@ -42,9 +42,12 @@ def fit_corrector(corrector, errors, config, seed, device, stage, progress_facto
         parameters = list(corrector.mlp.parameters()) if nonlinear else [corrector.bias, corrector.beta]
         optimizer = torch.optim.Adam(parameters, lr=lr, weight_decay=0)
         losses, processed = [], 0
+        visits = np.zeros(len(target),dtype=np.int32)
         with stage(name), progress_factory(name, steps) as progress:
             for step in range(1, steps+1):
-                indices = torch.as_tensor(next(batches), device=device)
+                host_indices = next(batches)
+                visits[host_indices] += 1
+                indices = torch.as_tensor(host_indices, device=device)
                 optimizer.zero_grad(set_to_none=True)
                 loss = F.huber_loss(corrector(history[indices], nonlinear=nonlinear), target[indices], delta=1)
                 loss.backward()
@@ -56,6 +59,8 @@ def fit_corrector(corrector, errors, config, seed, device, stage, progress_facto
                 progress.update(step)
             first, last = torch.stack((losses[0], losses[-1])).cpu().tolist()
         result[name] = dict(optimizer="Adam", updates=steps, processed_samples=processed,
+                            distinct_samples_seen=int(np.count_nonzero(visits)),
+                            minimum_sample_visits=int(visits.min()),maximum_sample_visits=int(visits.max()),
                             first_loss=first, last_loss=last, learning_rate=lr, budget_exhausted=True)
         del optimizer
     result["maximum_beta_l1"] = float(corrector.beta.detach().abs().sum(-1).max().cpu())
