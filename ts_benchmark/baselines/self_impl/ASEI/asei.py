@@ -237,6 +237,19 @@ class ASEI:
     def _stage_seed(self,stage):
         return int(np.random.SeedSequence([self.seed,stage]).generate_state(1)[0])
 
+    def _initialize_cuda_runtime(self):
+        if self.device.type!="cuda":
+            return
+        logger.info("ASEI CUDA startup implementation=%s torch=%s device=%s",
+                    IMPLEMENTATION_VERSION,torch.__version__,self.device)
+        # Availability checks do not initialize PyTorch's caching allocator.
+        # Some releases call native resetPeakMemoryStats without lazy init.
+        torch.cuda.init()
+        if self.device.index is None:
+            self.device = torch.device("cuda",torch.cuda.current_device())
+        torch.cuda.set_device(self.device)
+        torch.cuda.reset_peak_memory_stats(self.device)
+
     @contextmanager
     def _stage(self,name):
         if self.device.type=="cuda":
@@ -589,6 +602,7 @@ class ASEI:
         self._fitted = False
         self._extractor_calls = 0
         started = time.perf_counter()
+        self._initialize_cuda_runtime()
         if self.config.predictor_amp=="bf16":
             if self.device.type!="cuda":
                 raise ValueError("predictor_amp='bf16' training requires a supported CUDA GPU")
@@ -601,7 +615,6 @@ class ASEI:
             torch.backends.cudnn.allow_tf32 = False
             torch.backends.cudnn.benchmark = False
             torch.backends.cudnn.deterministic = True
-            torch.cuda.reset_peak_memory_stats(self.device)
         values = self._values(train_data,True)
         external = None if valid_data is None else self._values(valid_data)
         parts,bounds = chronological_split(values,external)

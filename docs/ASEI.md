@@ -1,6 +1,6 @@
 # ASEI 运行与配置
 
-实现依据工作区的 [In1_1_4.md](../../In1_1_4.md) 和 [impl.md](../../impl.md)，TAB 入口为 `self_impl.ASEI`。每个文件分别拟合预测器、校正器、评分器和阈值。模型使用一张 CUDA GPU；`device="auto"` 在 CUDA 不可用时使用 CPU。完整默认值见 [Config](../ts_benchmark/baselines/self_impl/ASEI/asei.py)，实现版本为 `asei-finite-bank-scan-3`。
+实现依据工作区的 [In1_1_4.md](../../In1_1_4.md) 和 [impl.md](../../impl.md)，TAB 入口为 `self_impl.ASEI`。每个文件分别拟合预测器、校正器、评分器和阈值。模型使用一张 CUDA GPU；`device="auto"` 在 CUDA 不可用时使用 CPU。完整默认值见 [Config](../ts_benchmark/baselines/self_impl/ASEI/asei.py)，实现版本为 `asei-finite-bank-scan-3.1`。
 
 ## 服务器运行
 
@@ -39,6 +39,8 @@ nohup uv run python -u ./scripts/run_benchmark.py \
 ```
 
 `--gpus 1` 将物理 GPU1 映射为逻辑 `cuda:0`。CPU 可显式指定 JSON `"device":"cpu"`。TAB 的 `--seed` 与模型 JSON 的 `seed` 在上述命令中均为 42；模型独立使用 JSON 的种子，默认是 2026。两个评测进程各自训练一遍。
+
+CUDA 拟合在重置峰值显存统计前，先显式初始化 PyTorch CUDA 运行时并选定逻辑设备；CPU 路径不调用这些 CUDA API。启动日志包含 `ASEI CUDA startup implementation=asei-finite-bank-scan-3.1`。这一初始化顺序适用于尚未创建 CUDA 张量的新进程，避免在分配器尚未注册设备时调用 `reset_peak_memory_stats`。CUDA 初始化错误直接报告，不跳过错误继续训练。
 
 原始两个 TAB 配置保持 `metrics="all"`：label 评测及报告包含全部 16 个原有指标，score 包含全部 6 个原有指标。VUS_ROC/PR 在一次评测内共用曲线计算，数值和指标定义不变。
 

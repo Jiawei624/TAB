@@ -3,6 +3,9 @@ import copy
 from dataclasses import asdict
 import json
 from pathlib import Path
+import subprocess
+import sys
+import textwrap
 from unittest.mock import patch
 import numpy as np
 import pytest
@@ -218,6 +221,101 @@ def test_complete_fit_with_disk_spill_and_equal_validation_early_stop(tmp_path):
     for stats in model.metadata_["evidence_banks"].values():
         assert stats["device_bytes"]==stats["host_bytes"]==0 and stats["disk_bytes"]>0
     assert not list(tmp_path.glob(".asei-bank-*"))
+
+
+@pytest.mark.parametrize("requested,index",[("cuda:0",0),("cuda:1",1),("cuda",1)])
+def test_fit_initializes_selected_cuda_before_resetting_memory_stats(requested,index):
+    # Reproduce PyTorch's lazy allocator on CPU: availability/device_count alone
+    # do not register allocator devices. reset_peak_memory_stats must come later.
+    model = ASEI(device="cpu")
+    model.device = torch.device(requested)
+    events = []
+    initialized = False
+
+    class ReachedInputValidation(Exception):
+        pass
+
+    def initialize():
+        nonlocal initialized
+        initialized = True
+        events.append("init")
+
+    def select(device):
+        assert initialized
+        assert device==torch.device("cuda",index)
+        events.append("select")
+
+    def reset(device):
+        if not initialized:
+            raise RuntimeError("Invalid device argument")
+        assert device==torch.device("cuda",index)
+        events.append("reset")
+
+    with patch("torch.cuda.init",side_effect=initialize), \
+            patch("torch.cuda.current_device",return_value=index), \
+            patch("torch.cuda.set_device",side_effect=select), \
+            patch("torch.cuda.reset_peak_memory_stats",side_effect=reset), \
+            patch("torch.manual_seed"), \
+            patch.object(model,"_values",side_effect=ReachedInputValidation):
+        with pytest.raises(ReachedInputValidation):
+            model.detect_fit(None)
+    assert events==["init","select","reset"]
+    assert model.device==torch.device("cuda",index)
+
+
+def test_cpu_fit_does_not_initialize_cuda_or_reset_cuda_statistics():
+    model = ASEI(device="cpu")
+
+    class ReachedInputValidation(Exception):
+        pass
+
+    with patch("torch.cuda.init",side_effect=AssertionError("CPU initialized CUDA")), \
+            patch("torch.cuda.set_device",side_effect=AssertionError("CPU selected CUDA")), \
+            patch("torch.cuda.reset_peak_memory_stats",side_effect=AssertionError("CPU reset CUDA stats")), \
+            patch.object(model,"_values",side_effect=ReachedInputValidation):
+        with pytest.raises(ReachedInputValidation):
+            model.detect_fit(None)
+
+
+def test_cuda_initialization_errors_are_not_silently_ignored():
+    model = ASEI(device="cpu")
+    model.device = torch.device("cuda:0")
+    with patch("torch.cuda.init",side_effect=RuntimeError("CUDA driver initialization failed")), \
+            patch("torch.cuda.reset_peak_memory_stats") as reset, \
+            patch.object(model,"_values") as values:
+        with pytest.raises(RuntimeError,match="CUDA driver initialization failed"):
+            model.detect_fit(None)
+    reset.assert_not_called()
+    values.assert_not_called()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason="Requires one CUDA GPU")
+def test_fresh_process_single_gpu_fit_initializes_allocator():
+    # Other GPU tests can initialize the allocator and conceal the startup bug.
+    # Inherit CUDA_VISIBLE_DEVICES so physical GPU1 remains logical cuda:0.
+    program = textwrap.dedent('''
+        import numpy as np
+        import torch
+        from ts_benchmark.baselines.self_impl.ASEI import ASEI
+        assert not torch.cuda.is_initialized()
+        values = np.random.default_rng(42).normal(size=(4000,3))
+        model = ASEI(device="auto",seed=42,predictor_epochs=1,
+                     corrector_linear_steps=1,corrector_nonlinear_steps=1,
+                     score_epochs=1,auxiliary_train_pairs=12,
+                     auxiliary_validation_pairs=6)
+        assert model.device==torch.device("cuda:0")
+        model.detect_fit(values)
+        assert torch.cuda.is_initialized() and torch.cuda.current_device()==0
+        assert model._fitted
+        assert model.metadata_["peak_cuda_allocated_bytes"]>0
+        assert model.metadata_["calibration"][0]["N"]==311
+        print("fresh-process CUDA fit passed")
+    ''')
+    result = subprocess.run([sys.executable,"-B","-c",program],
+                            cwd=str(Path(__file__).resolve().parents[1]),
+                            capture_output=True,text=True,timeout=180)
+    assert result.returncode==0,result.stdout+result.stderr
+    assert "fresh-process CUDA fit passed" in result.stdout
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(),reason="Requires one CUDA GPU")

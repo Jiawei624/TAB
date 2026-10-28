@@ -1,5 +1,5 @@
 {
-  "implementation_version": "asei-finite-bank-scan-3",
+  "implementation_version": "asei-finite-bank-scan-3.1",
   "scope": "Synthetic implementation verification only; no complete benchmark or detection-quality claim.",
   "official_configuration": {
     "seed": 2026,
@@ -174,7 +174,7 @@
         "score_transform": "raw"
       },
       "metadata": {
-        "implementation_version": "asei-finite-bank-scan-3",
+        "implementation_version": "asei-finite-bank-scan-3.1",
         "data_sha256": "33a1b60708d190c3c3f4697412cf404f2d99c0188aa53fa00ecac10a871dca9b",
         "seed": 42,
         "splits": {
@@ -325,14 +325,14 @@
           "pandas": "2.3.3"
         },
         "stage_seconds": {
-          "graph": 0.0011304999934509397,
-          "predictor": 0.09436009998898953,
-          "corrector_linear": 0.0021872000070288777,
-          "corrector_nonlinear": 0.0029190999921411276,
-          "reference": 0.0028822000604122877,
-          "bank_build": 0.10985469992738217,
-          "scorer": 0.06577900005504489,
-          "calibration": 0.004507199977524579
+          "graph": 0.0025271999184042215,
+          "predictor": 0.2509429999627173,
+          "corrector_linear": 0.006570199970155954,
+          "corrector_nonlinear": 0.009138799970969558,
+          "reference": 0.007590300054289401,
+          "bank_build": 0.2027646000497043,
+          "scorer": 0.11427729995921254,
+          "calibration": 0.008236599969677627
         },
         "predictor": {
           "best_epoch": 1,
@@ -403,7 +403,7 @@
             "device_bytes": 0,
             "host_bytes": 100080,
             "disk_bytes": 0,
-            "cache_key": "c5f8344de77a0c642b2f37c8e9a5941a48018f7d40192a63dc0d890c035a8156",
+            "cache_key": "994a1e6a5eaa11fba35ef22063937a6b09156ba5908e8867c6668f1140470bfb",
             "dtype": "float32"
           },
           "validation": {
@@ -411,7 +411,7 @@
             "device_bytes": 0,
             "host_bytes": 465120,
             "disk_bytes": 0,
-            "cache_key": "f1aa27060f9bf1bbecfdbafd5c1f7a766651ea7205bbdf2a1050ceb9915394b9",
+            "cache_key": "856fa682cfc71d6151f0533223982dbc41e4a738d1861b8dea710e648620b77a",
             "dtype": "float32"
           }
         },
@@ -468,7 +468,7 @@
           "corrector": 79,
           "scorer": 8
         },
-        "total_fit_seconds": 1.283905400079675,
+        "total_fit_seconds": 2.4281733999960124,
         "peak_cuda_allocated_bytes": 0,
         "training_tasks": {
           "count": 12,
@@ -631,7 +631,7 @@
         "score_transform": "raw"
       },
       "metadata": {
-        "implementation_version": "asei-finite-bank-scan-3",
+        "implementation_version": "asei-finite-bank-scan-3.1",
         "data_sha256": "c1e30ba3ceb688fe275d2718c81c6685a2d11370a1328bb10dedd0214480e2d0",
         "seed": 43,
         "splits": {
@@ -782,14 +782,14 @@
           "pandas": "2.3.3"
         },
         "stage_seconds": {
-          "graph": 0.0011762999929487705,
-          "predictor": 0.061937399907037616,
-          "corrector_linear": 0.0020589999621734023,
-          "corrector_nonlinear": 0.002760100062005222,
-          "reference": 0.003578400006517768,
-          "bank_build": 0.10423960001207888,
-          "scorer": 0.06572999991476536,
-          "calibration": 0.005292599904350936
+          "graph": 0.0025689000030979514,
+          "predictor": 0.10864839993882924,
+          "corrector_linear": 0.004377700039185584,
+          "corrector_nonlinear": 0.005646000034175813,
+          "reference": 0.005046800011768937,
+          "bank_build": 0.17272079992108047,
+          "scorer": 0.09083240001928061,
+          "calibration": 0.008089800016023219
         },
         "predictor": {
           "best_epoch": 1,
@@ -860,7 +860,7 @@
             "device_bytes": 0,
             "host_bytes": 97200,
             "disk_bytes": 0,
-            "cache_key": "7364d94ea425135115c0ae0096196ff5e6164d72a4a0d6fbd5a15ea282d8f544",
+            "cache_key": "27a355bf9b8e1b91cb743d24f1a4a08e89d9afe1d63924569be4ef1866d00f68",
             "dtype": "float32"
           },
           "validation": {
@@ -868,7 +868,7 @@
             "device_bytes": 0,
             "host_bytes": 444960,
             "disk_bytes": 0,
-            "cache_key": "9916df61e5005ce3393bdfb04bb85b70fcd354baf09a449b1141c968f26cef68",
+            "cache_key": "432ceccfd0c65d11f5d71941d94e65d29efc1bd5831f635bbd6f8d5de656dfa8",
             "dtype": "float32"
           }
         },
@@ -925,7 +925,7 @@
           "corrector": 79,
           "scorer": 8
         },
-        "total_fit_seconds": 0.2634070999920368,
+        "total_fit_seconds": 0.4228206000989303,
         "peak_cuda_allocated_bytes": 0,
         "training_tasks": {
           "count": 12,
@@ -1044,11 +1044,11 @@
     "timings": [
       {
         "backend": "reference",
-        "median_forward_backward_seconds": 0.054646900040097535
+        "median_forward_backward_seconds": 0.08134610007982701
       },
       {
         "backend": "scan",
-        "median_forward_backward_seconds": 0.007344100042246282
+        "median_forward_backward_seconds": 0.016179600032046437
       }
     ],
     "scope": "Synthetic timing; not a benchmark speed claim"
