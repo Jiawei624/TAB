@@ -86,6 +86,7 @@ class Config:
     score_learning_rate: float = 1e-3
     score_gradient_clip: float = 1.
     evidence_chunk_size: int = 1024
+    frozen_evidence_backend: str = "canonical"
     scan_chunk_size: int = 256
     recurrence_backend: str = "scan"
     evidence_device_cache_mb: float = 256.
@@ -188,6 +189,8 @@ class ASEI:
             raise ValueError("num_workers must be a nonnegative integer")
         if cfg.recurrence_backend not in ("scan","reference"):
             raise ValueError("recurrence_backend must be scan or reference")
+        if cfg.frozen_evidence_backend not in ("canonical","legacy"):
+            raise ValueError("frozen_evidence_backend must be canonical or legacy")
         if cfg.predictor_amp not in ("off","bf16") or cfg.score_transform not in ("raw","bounded"):
             raise ValueError("Invalid predictor_amp or score_transform")
         for name in ("auxiliary_train_pairs","auxiliary_validation_pairs"):
@@ -356,6 +359,9 @@ class ASEI:
         single = values.ndim==2
         if single:
             values = values[None]
+        if self.config.frozen_evidence_backend=="canonical":
+            result = self._canonical_error_tensor(values)
+            return result[0] if single else result
         outputs = []
         for begin in range(self.history,values.shape[1],self.config.evidence_chunk_size):
             end = min(values.shape[1],begin+self.config.evidence_chunk_size)
@@ -364,11 +370,32 @@ class ASEI:
         result = torch.cat(outputs,1) if outputs else values.new_empty((values.shape[0],0,len(self.columns_),2))
         return result[0] if single else result
 
+    def _canonical_error_tensor(self,values):
+        # Fixed B=1 and fixed temporal/target geometry prevent a GPU GEMM or
+        # convolution shape change from moving a tied error across its ECDF atom.
+        batch,length,channels = values.shape
+        block = self.config.evidence_chunk_size+self.config.ar_order+self.config.rolling_window-1
+        sequences = []
+        for sequence in range(batch):
+            pieces = []
+            for begin in range(self.history,length,block):
+                end = min(length,begin+block)
+                count = end-begin
+                inputs = values.new_zeros((1,self.history+block-1,channels))
+                inputs[:,:self.history+count-1].copy_(values[sequence:sequence+1,begin-self.history:end-1])
+                predicted = self.predictor(inputs,output_steps=block)[0,:count]
+                pieces.append((values[sequence,begin:end,:,None]-predicted).square())
+            sequences.append(torch.cat(pieces,0) if pieces else values.new_empty((0,channels,2)))
+        return torch.stack(sequences,0) if sequences else values.new_empty((0,max(0,length-self.history),channels,2))
+
     @torch.no_grad()
     def _residual_tensor(self,errors):
         order = self.config.ar_order
         single = errors.ndim==3
         values = errors[None] if single else errors
+        if self.config.frozen_evidence_backend=="canonical":
+            result = self._canonical_residual_tensor(values)
+            return result[0] if single else result
         if values.shape[1]<=order:
             result = values.new_empty((values.shape[0],0,values.shape[2],2))
         else:
@@ -378,6 +405,44 @@ class ASEI:
                                    history.split(self.config.evidence_chunk_size,dim=1)],1)
             result = self.corrector.error_scale*(y[:,order:]-predicted)
         return result[0] if single else result
+
+    def _canonical_residual_tensor(self,errors):
+        batch,length,channels,_ = errors.shape
+        order = self.config.ar_order
+        block = self.config.evidence_chunk_size+self.config.rolling_window-1
+        sequences = []
+        for sequence in range(batch):
+            y = errors[sequence:sequence+1]/self.corrector.error_scale
+            pieces = []
+            if length>order:
+                history = y.unfold(1,order+1,1)[...,:order].flip(-1)
+                for begin in range(0,length-order,block):
+                    count = min(block,length-order-begin)
+                    # Only unused future COMPUTATION slots are filled. Repeating
+                    # a valid history avoids extreme normalized dummy inputs.
+                    inputs = history[:,begin+count-1:begin+count].expand(1,block,channels,2,order).clone()
+                    inputs[:,:count].copy_(history[:,begin:begin+count])
+                    predicted = self.corrector(inputs)[:,:count]
+                    pieces.append(self.corrector.error_scale*(y[:,order+begin:order+begin+count]-predicted))
+            sequences.append(torch.cat(pieces,1)[0] if pieces else errors.new_empty((0,channels,2)))
+        return torch.stack(sequences,0) if sequences else errors.new_empty((0,max(0,length-order),channels,2))
+
+    @torch.no_grad()
+    def _check_frozen_evidence_consistency(self,values):
+        with self._stage("frozen_numerics"):
+            sample = values[:min(len(values),self.raw_history+self.config.evidence_chunk_size)]
+            evidence = self._evidence_tensor(sample)
+            shifted = self._evidence_tensor(sample[13:])
+            batched = self._evidence_tensor(np.stack((sample,sample)))[0]
+            errors = torch.stack(((evidence[13:]-shifted).abs().max(),(evidence-batched).abs().max())).cpu().tolist()
+            record = dict(backend=self.config.frozen_evidence_backend,evidence_slice_max_abs=errors[0],
+                          evidence_batch_max_abs=errors[1],tolerance=1e-5,passed=max(errors)<=1e-5)
+            self.metadata_["frozen_numerical_preflight"] = record
+            logger.info("ASEI frozen numerical preflight=%s",record)
+            if not record["passed"]:
+                raise RuntimeError("ASEI frozen evidence differs across slices/batches beyond tolerance: "
+                                   f"{record}. Refit with canonical frozen computation; do not reuse legacy references "
+                                   "or change ECDF ties with an epsilon.")
 
     @torch.no_grad()
     def _evidence_tensor(self,values):
@@ -689,7 +754,13 @@ class ASEI:
                               counters=dict(normal_evidence_passes=0,changed_trajectory_builds=0,score_epoch_feature_extractor_calls=0),
                               numeric_policy=dict(dtype="float32",evidence_amp="off",tf32=False,
                                                   predictor_amp=cfg.predictor_amp,recurrence_backend=cfg.recurrence_backend,
-                                                  scan_chunk_size=cfg.scan_chunk_size),
+                                                  scan_chunk_size=cfg.scan_chunk_size,
+                                                  frozen_evidence_backend=cfg.frozen_evidence_backend,
+                                                  frozen_sequence_batch=1 if cfg.frozen_evidence_backend=="canonical" else None,
+                                                  frozen_prediction_targets=cfg.evidence_chunk_size+cfg.ar_order+cfg.rolling_window-1
+                                                      if cfg.frozen_evidence_backend=="canonical" else None,
+                                                  frozen_correction_targets=cfg.evidence_chunk_size+cfg.rolling_window-1
+                                                      if cfg.frozen_evidence_backend=="canonical" else None),
                               versions=dict(python=platform.python_version(),numpy=np.__version__,torch=str(torch.__version__),pandas=pd.__version__))
         logger.info("ASEI implementation=%s device=%s splits=%s capacity=(d=%d Q=%d Bp=%d MA=%d) protocol=%s",
                     IMPLEMENTATION_VERSION,self.device,bounds,cfg.hidden_dim,cfg.predictor_block_size,cfg.batch_size,
@@ -697,6 +768,7 @@ class ASEI:
         self._fit_predictor(parts["F"],parts["Vsel"])
         self._fit_corrector(parts["Cfit"])
         self._fit_reference(parts["Rref"])
+        self._check_frozen_evidence_consistency(parts["Rref"])
         self._fit_scorer(parts["F"],parts["Vsel"],scale)
         self._calibrate(parts["Vcal"])
         self.metadata_["data_coverage"] = dict(
@@ -786,6 +858,9 @@ class ASEI:
         if payload.get("format_version")!=3:
             raise ValueError("Unsupported ASEI checkpoint format; ASEI 1.4 requires format_version=3 and refitting older models")
         cfg = dict(payload["config"],device=device)
+        # Old arrays/centers/thresholds were estimated with variable geometries.
+        # Preserve that numerical path when inspecting a historical checkpoint.
+        cfg.setdefault("frozen_evidence_backend","legacy")
         detector = cls(**cfg)
         detector._requested_config = payload["requested_config"]
         detector.columns_,detector.seed = payload["columns"],payload["seed"]

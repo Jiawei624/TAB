@@ -209,7 +209,7 @@
         "threshold": 37.3153076171875,
         "false_alarm_count": 412,
         "actual_false_alarm_rate": 0.00833822428204246,
-        "resolution": 2.023840845155937e-05
+        "resolution": 2.023840845155937E-05
       }
     ],
     "counters": {
@@ -255,5 +255,354 @@
       }
     },
     "scope": "Log/configuration arithmetic and supplied measurements; no raw SWAT prediction reconstruction."
+  },
+  "server_followup": {
+    "source": "User-pasted server diagnostic JSON",
+    "audit_runtime_version": "asei-finite-bank-scan-3.2",
+    "fitted_version": "asei-finite-bank-scan-3.1",
+    "device": "cuda:0",
+    "cuda_available": true,
+    "data_fingerprint_matches": true,
+    "preprocessing": {
+      "actual_constant_columns": [
+        "P102",
+        " P201",
+        " P202",
+        " P204",
+        "P206",
+        "P401",
+        "P403",
+        "P404",
+        "P502",
+        "P601",
+        "P603"
+      ],
+      "saved_constant_columns": [
+        "P102",
+        " P201",
+        " P202",
+        " P204",
+        "P206",
+        "P401",
+        "P403",
+        "P404",
+        "P502",
+        "P601",
+        "P603"
+      ],
+      "constant_scale_violations": [],
+      "action": "Refit if constant_scale_violations is nonempty; do not replace a fitted scaler in place."
+    },
+    "frozen_numeric_probe": {
+      "raw_error_slice_max_abs": 7.748603820800781E-07,
+      "residual_slice_max_abs": 7.59027898311615E-07,
+      "evidence_slice_max_abs": 6.0,
+      "evidence_batch_max_abs": 6.0,
+      "score_scan_reference_max_abs": 1.52587890625E-05,
+      "warning": "An ECDF can amplify tiny raw-value differences at ties; diagnose on the deployment GPU.",
+      "dtype": "float32",
+      "reference_is_frozen": true
+    },
+    "calibration_reproduction": [
+      {
+        "alpha": 0.01,
+        "N": 49411,
+        "recomputed_threshold": 37.3153076171875,
+        "saved_threshold": 37.3153076171875,
+        "threshold_abs_difference": 0.0,
+        "recomputed_false_alarms": 412,
+        "calibration_scores_max_abs_difference": 0.0
+      }
+    ],
+    "learned_scorer": {
+      "decay": 0.877622127532959,
+      "kappa": 0.027109438553452492,
+      "training_bias": 0.5455318689346313,
+      "gate_bias": 0.41058266162872314,
+      "gate_weight": [
+        0.4030279219150543,
+        0.4117060899734497,
+        0.4174955189228058,
+        0.41144537925720215
+      ]
+    },
+    "posthoc_training_label_counts": {
+      "F": {
+        "0.0": 316800
+      },
+      "Cfit": {
+        "0.0": 39600
+      },
+      "Rref": {
+        "0.0": 39600
+      },
+      "Vsel": {
+        "0.0": 49500
+      },
+      "Vcal": {
+        "0.0": 49500
+      }
+    },
+    "source_timestamp_diagnostics": {
+      "training": {
+        "missing_timestamps": 0,
+        "duplicate_timestamps": 0,
+        "modal_step_ns": 1,
+        "irregular_step_count": 0,
+        "nonpositive_step_count": 0
+      },
+      "test": {
+        "missing_timestamps": 0,
+        "duplicate_timestamps": 0,
+        "modal_step_ns": 1,
+        "irregular_step_count": 0,
+        "nonpositive_step_count": 0
+      }
+    },
+    "sequences": {
+      "F": {
+        "points": 316800,
+        "ready_scores": 316711,
+        "score_quantiles": {
+          "min": 2.661388635635376,
+          "median": 33.65890884399414,
+          "p90": 40.428226470947266,
+          "p99": 40.657440185546875,
+          "p999": 40.65744400024414,
+          "max": 40.65744400024414
+        },
+        "empirical_alarms": {
+          "0.01": {
+            "alpha": 0.01,
+            "threshold": 37.3153076171875,
+            "alarms": 95004,
+            "ready_alarm_fraction": 0.29997063568995075,
+            "all_points_alarm_fraction": 0.2998863636363636
+          }
+        },
+        "top_dominant_channels": [
+          {
+            "channel": "AIT401",
+            "mean_corrected_evidence": 2.743485354311728,
+            "mean_state_evidence": 3.032176441031351,
+            "corrected_cap_fraction": 0.2593689515046841,
+            "state_cap_fraction": 0.4259782577807528,
+            "maximum_score_dominance": 0.3092377593452706
+          },
+          {
+            "channel": "P501",
+            "mean_corrected_evidence": 2.0899663708647,
+            "mean_state_evidence": 3.1728394163750346,
+            "corrected_cap_fraction": 0.20327048949989107,
+            "state_cap_fraction": 0.44334740504750386,
+            "maximum_score_dominance": 0.1770891548867369
+          }
+        ]
+      },
+      "Cfit": {
+        "points": 39600,
+        "ready_scores": 39511,
+        "score_quantiles": {
+          "min": 3.973562479019165,
+          "median": 17.153362274169922,
+          "p90": 28.51468849182129,
+          "p99": 34.90906448364258,
+          "p999": 37.196075439453125,
+          "max": 38.30790328979492
+        },
+        "empirical_alarms": {
+          "0.01": {
+            "alpha": 0.01,
+            "threshold": 37.3153076171875,
+            "alarms": 15,
+            "ready_alarm_fraction": 0.000379641112601554,
+            "all_points_alarm_fraction": 0.0003787878787878788
+          }
+        },
+        "top_dominant_channels": [
+          {
+            "channel": "AIT401",
+            "mean_corrected_evidence": 0.7299102023577673,
+            "mean_state_evidence": 0.7427874084353033,
+            "corrected_cap_fraction": 0.007719369289564931,
+            "state_cap_fraction": 0.007997772772139405,
+            "maximum_score_dominance": 0.13426640682341626
+          },
+          {
+            "channel": "FIT601",
+            "mean_corrected_evidence": -0.04422737366758951,
+            "mean_state_evidence": -0.03553690457108117,
+            "corrected_cap_fraction": 0.003315532383386905,
+            "state_cap_fraction": 0.003416770013413986,
+            "maximum_score_dominance": 0.09779555060616031
+          }
+        ]
+      },
+      "Rref": {
+        "points": 39600,
+        "ready_scores": 39511,
+        "score_quantiles": {
+          "min": 1.3164138793945312,
+          "median": 12.738221168518066,
+          "p90": 27.349523544311523,
+          "p99": 33.96421279907227,
+          "p999": 37.196075439453125,
+          "max": 38.20280075073242
+        },
+        "empirical_alarms": {
+          "0.01": {
+            "alpha": 0.01,
+            "threshold": 37.3153076171875,
+            "alarms": 15,
+            "ready_alarm_fraction": 0.000379641112601554,
+            "all_points_alarm_fraction": 0.0003787878787878788
+          }
+        },
+        "top_dominant_channels": [
+          {
+            "channel": "AIT401",
+            "mean_corrected_evidence": -0.0005280152500657823,
+            "mean_state_evidence": -0.0005837115342112995,
+            "corrected_cap_fraction": 0.004859406241299891,
+            "state_cap_fraction": 0.004859406241299891,
+            "maximum_score_dominance": 0.07861101971602845
+          },
+          {
+            "channel": "AIT501",
+            "mean_corrected_evidence": -6.263388252871379E-05,
+            "mean_state_evidence": -5.9706658009519E-05,
+            "corrected_cap_fraction": 0.003897648756042621,
+            "state_cap_fraction": 0.00475816861127281,
+            "maximum_score_dominance": 0.06643719470527194
+          }
+        ]
+      },
+      "Vsel": {
+        "points": 49500,
+        "ready_scores": 49411,
+        "score_quantiles": {
+          "min": 1.5659658908843994,
+          "median": 20.870206832885742,
+          "p90": 37.113224029541016,
+          "p99": 37.3153076171875,
+          "p999": 37.3153076171875,
+          "max": 38.31874465942383
+        },
+        "empirical_alarms": {
+          "0.01": {
+            "alpha": 0.01,
+            "threshold": 37.3153076171875,
+            "alarms": 16,
+            "ready_alarm_fraction": 0.00032381453522494993,
+            "all_points_alarm_fraction": 0.00032323232323232324
+          }
+        },
+        "top_dominant_channels": [
+          {
+            "channel": "AIT203",
+            "mean_corrected_evidence": 0.5521796949284534,
+            "mean_state_evidence": 0.5696598168933199,
+            "corrected_cap_fraction": 0.12568051648418369,
+            "state_cap_fraction": 0.18801481451498653,
+            "maximum_score_dominance": 0.21167351399485945
+          },
+          {
+            "channel": " AIT201",
+            "mean_corrected_evidence": 0.5313019239425524,
+            "mean_state_evidence": 0.5940037351500848,
+            "corrected_cap_fraction": 0.003501244662119771,
+            "state_cap_fraction": 0.003278622169152618,
+            "maximum_score_dominance": 0.15077614296411732
+          }
+        ]
+      },
+      "Vcal": {
+        "points": 49500,
+        "ready_scores": 49411,
+        "score_quantiles": {
+          "min": 3.0020554065704346,
+          "median": 36.58452224731445,
+          "p90": 37.3153076171875,
+          "p99": 37.3153076171875,
+          "p999": 37.33604274749756,
+          "max": 38.29368209838867
+        },
+        "empirical_alarms": {
+          "0.01": {
+            "alpha": 0.01,
+            "threshold": 37.3153076171875,
+            "alarms": 412,
+            "ready_alarm_fraction": 0.00833822428204246,
+            "all_points_alarm_fraction": 0.008323232323232323
+          }
+        },
+        "top_dominant_channels": [
+          {
+            "channel": "AIT502",
+            "mean_corrected_evidence": 3.69997360037386,
+            "mean_state_evidence": 4.0430669264967,
+            "corrected_cap_fraction": 0.665580538746433,
+            "state_cap_fraction": 0.8678027159944142,
+            "maximum_score_dominance": 0.41215518811600654
+          },
+          {
+            "channel": "AIT203",
+            "mean_corrected_evidence": 0.6729983231309661,
+            "mean_state_evidence": 0.5798238107821843,
+            "corrected_cap_fraction": 0.2103984942624112,
+            "state_cap_fraction": 0.23438100827750905,
+            "maximum_score_dominance": 0.21296877213575924
+          }
+        ]
+      },
+      "test": {
+        "points": 449919,
+        "ready_scores": 449830,
+        "score_quantiles": {
+          "min": 4.386428356170654,
+          "median": 38.891048431396484,
+          "p90": 48.80693817138672,
+          "p99": 48.806941986083984,
+          "p999": 48.80694580078125,
+          "max": 48.80694580078125
+        },
+        "empirical_alarms": {
+          "0.01": {
+            "alpha": 0.01,
+            "threshold": 37.3153076171875,
+            "alarms": 381276,
+            "ready_alarm_fraction": 0.8476002045217083,
+            "all_points_alarm_fraction": 0.8474325378568143,
+            "posthoc_confusion": {
+              "tp": 50977,
+              "fp": 330299,
+              "fn": 3644,
+              "tn": 64999
+            },
+            "normal_false_positive_rate": 0.8355696208936043,
+            "recall": 0.9332857325936911,
+            "precision": 0.13370104596145574
+          }
+        },
+        "top_dominant_channels": [
+          {
+            "channel": "AIT501",
+            "mean_corrected_evidence": 4.4757024368179925,
+            "mean_state_evidence": 4.701511228659105,
+            "corrected_cap_fraction": 0.8860925238423404,
+            "state_cap_fraction": 0.9931618611475447,
+            "maximum_score_dominance": 0.30075472956450217
+          },
+          {
+            "channel": "P301",
+            "mean_corrected_evidence": 2.5734428208292432,
+            "mean_state_evidence": 3.491331505313871,
+            "corrected_cap_fraction": 0.3979525598559456,
+            "state_cap_fraction": 0.5827268079052086,
+            "maximum_score_dominance": 0.2160460618455861
+          }
+        ]
+      }
+    }
   }
 }

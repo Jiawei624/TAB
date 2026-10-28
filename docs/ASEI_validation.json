@@ -1,5 +1,5 @@
 {
-  "implementation_version": "asei-finite-bank-scan-3.2",
+  "implementation_version": "asei-finite-bank-scan-3.3",
   "scope": "Synthetic implementation verification only; no complete benchmark or detection-quality claim.",
   "official_configuration": {
     "seed": 2026,
@@ -69,6 +69,7 @@
     "score_learning_rate": 0.001,
     "score_gradient_clip": 1.0,
     "evidence_chunk_size": 1024,
+    "frozen_evidence_backend": "canonical",
     "scan_chunk_size": 256,
     "recurrence_backend": "scan",
     "evidence_device_cache_mb": 256.0,
@@ -162,6 +163,7 @@
         "score_learning_rate": 0.001,
         "score_gradient_clip": 1.0,
         "evidence_chunk_size": 1024,
+        "frozen_evidence_backend": "canonical",
         "scan_chunk_size": 256,
         "recurrence_backend": "scan",
         "evidence_device_cache_mb": 256.0,
@@ -174,7 +176,7 @@
         "score_transform": "raw"
       },
       "metadata": {
-        "implementation_version": "asei-finite-bank-scan-3.2",
+        "implementation_version": "asei-finite-bank-scan-3.3",
         "data_sha256": "33a1b60708d190c3c3f4697412cf404f2d99c0188aa53fa00ecac10a871dca9b",
         "seed": 42,
         "splits": {
@@ -264,6 +266,7 @@
           "score_learning_rate": 0.001,
           "score_gradient_clip": 1.0,
           "evidence_chunk_size": 1024,
+          "frozen_evidence_backend": "canonical",
           "scan_chunk_size": 256,
           "recurrence_backend": "scan",
           "evidence_device_cache_mb": 256.0,
@@ -316,7 +319,11 @@
           "tf32": false,
           "predictor_amp": "off",
           "recurrence_backend": "scan",
-          "scan_chunk_size": 256
+          "scan_chunk_size": 256,
+          "frozen_evidence_backend": "canonical",
+          "frozen_sequence_batch": 1,
+          "frozen_prediction_targets": 1035,
+          "frozen_correction_targets": 1031
         },
         "versions": {
           "python": "3.10.20",
@@ -325,14 +332,15 @@
           "pandas": "2.3.3"
         },
         "stage_seconds": {
-          "graph": 0.001234999974258244,
-          "predictor": 0.11764930002391338,
-          "corrector_linear": 0.0025381000014021993,
-          "corrector_nonlinear": 0.0033527000341564417,
-          "reference": 0.003504199907183647,
-          "bank_build": 0.12649749999400228,
-          "scorer": 0.07425619999412447,
-          "calibration": 0.004744600038975477
+          "graph": 0.0012662999797612429,
+          "predictor": 0.10603430005721748,
+          "corrector_linear": 0.0027904000598937273,
+          "corrector_nonlinear": 0.003476599929854274,
+          "reference": 0.00544769992120564,
+          "frozen_numerics": 0.01686800003517419,
+          "bank_build": 0.3039780000690371,
+          "scorer": 0.07341950002592057,
+          "calibration": 0.00633700005710125
         },
         "predictor": {
           "best_epoch": 1,
@@ -405,13 +413,20 @@
           "maximum_untruncated_evidence": 5.476463551931511,
           "dtype": "float32"
         },
+        "frozen_numerical_preflight": {
+          "backend": "canonical",
+          "evidence_slice_max_abs": 0.0,
+          "evidence_batch_max_abs": 0.0,
+          "tolerance": 1e-05,
+          "passed": true
+        },
         "evidence_banks": {
           "training": {
             "pairs": 12,
             "device_bytes": 0,
             "host_bytes": 100080,
             "disk_bytes": 0,
-            "cache_key": "aee027252985bbd4f385bb062cef47b95ea84b2f5ebbc96553404a793f40240d",
+            "cache_key": "308d76036b1c2943ca0e90c048a100c0440678e3250b02530910728faee5f431",
             "dtype": "float32"
           },
           "validation": {
@@ -419,7 +434,7 @@
             "device_bytes": 0,
             "host_bytes": 465120,
             "disk_bytes": 0,
-            "cache_key": "7a6d8179af28a8a71410f3a5bce466f8923969f6c641c43b2a6cb2f3ee9dedc6",
+            "cache_key": "af94e13e66bcd59c58e9c73806b343fddcec1d940cfc69b31597f5eb0a38c537",
             "dtype": "float32"
           }
         },
@@ -520,7 +535,7 @@
           "corrector": 79,
           "scorer": 8
         },
-        "total_fit_seconds": 1.493430700036697,
+        "total_fit_seconds": 1.630105199990794,
         "peak_cuda_allocated_bytes": 0,
         "training_tasks": {
           "count": 12,
@@ -671,6 +686,7 @@
         "score_learning_rate": 0.001,
         "score_gradient_clip": 1.0,
         "evidence_chunk_size": 1024,
+        "frozen_evidence_backend": "canonical",
         "scan_chunk_size": 256,
         "recurrence_backend": "scan",
         "evidence_device_cache_mb": 256.0,
@@ -683,7 +699,7 @@
         "score_transform": "raw"
       },
       "metadata": {
-        "implementation_version": "asei-finite-bank-scan-3.2",
+        "implementation_version": "asei-finite-bank-scan-3.3",
         "data_sha256": "c1e30ba3ceb688fe275d2718c81c6685a2d11370a1328bb10dedd0214480e2d0",
         "seed": 43,
         "splits": {
@@ -773,6 +789,7 @@
           "score_learning_rate": 0.001,
           "score_gradient_clip": 1.0,
           "evidence_chunk_size": 1024,
+          "frozen_evidence_backend": "canonical",
           "scan_chunk_size": 256,
           "recurrence_backend": "scan",
           "evidence_device_cache_mb": 256.0,
@@ -825,7 +842,11 @@
           "tf32": false,
           "predictor_amp": "off",
           "recurrence_backend": "scan",
-          "scan_chunk_size": 256
+          "scan_chunk_size": 256,
+          "frozen_evidence_backend": "canonical",
+          "frozen_sequence_batch": 1,
+          "frozen_prediction_targets": 1035,
+          "frozen_correction_targets": 1031
         },
         "versions": {
           "python": "3.10.20",
@@ -834,14 +855,15 @@
           "pandas": "2.3.3"
         },
         "stage_seconds": {
-          "graph": 0.0010727999033406377,
-          "predictor": 0.06768510001711547,
-          "corrector_linear": 0.003634000080637634,
-          "corrector_nonlinear": 0.003432300058193505,
-          "reference": 0.004416499985381961,
-          "bank_build": 0.14089420007076114,
-          "scorer": 0.08044540008995682,
-          "calibration": 0.007316499948501587
+          "graph": 0.001078900066204369,
+          "predictor": 0.06607179995626211,
+          "corrector_linear": 0.002319499966688454,
+          "corrector_nonlinear": 0.003153099911287427,
+          "reference": 0.004528499906882644,
+          "frozen_numerics": 0.016301500028930604,
+          "bank_build": 0.2896430999971926,
+          "scorer": 0.07186319993343204,
+          "calibration": 0.0061443999875336885
         },
         "predictor": {
           "best_epoch": 1,
@@ -914,13 +936,20 @@
           "maximum_untruncated_evidence": 5.337538079701318,
           "dtype": "float32"
         },
+        "frozen_numerical_preflight": {
+          "backend": "canonical",
+          "evidence_slice_max_abs": 0.0,
+          "evidence_batch_max_abs": 0.0,
+          "tolerance": 1e-05,
+          "passed": true
+        },
         "evidence_banks": {
           "training": {
             "pairs": 12,
             "device_bytes": 0,
             "host_bytes": 97200,
             "disk_bytes": 0,
-            "cache_key": "77d101907a56cbb81a3fd1891914f0c234cf10c0c0dc75d5a63224e29c847203",
+            "cache_key": "3fb02950cc8064e3c6d0f6bcf4c2d5cfa0af323aca2797375be6e7bade26bd8f",
             "dtype": "float32"
           },
           "validation": {
@@ -928,7 +957,7 @@
             "device_bytes": 0,
             "host_bytes": 444960,
             "disk_bytes": 0,
-            "cache_key": "7b4eed7ace5890a90ace6df308e870d73a968bd8540c8c5d7a78a1201243b34c",
+            "cache_key": "c6ff3b32a7d4413f852c6c4486310fb5b6f55d98a9df026fcbbe0e662e5bce71",
             "dtype": "float32"
           }
         },
@@ -1029,7 +1058,7 @@
           "corrector": 79,
           "scorer": 8
         },
-        "total_fit_seconds": 0.3275204000528902,
+        "total_fit_seconds": 0.4794756000628695,
         "peak_cuda_allocated_bytes": 0,
         "training_tasks": {
           "count": 12,
@@ -1148,11 +1177,11 @@
     "timings": [
       {
         "backend": "reference",
-        "median_forward_backward_seconds": 0.06553090002853423
+        "median_forward_backward_seconds": 0.06152930005919188
       },
       {
         "backend": "scan",
-        "median_forward_backward_seconds": 0.008198100025765598
+        "median_forward_backward_seconds": 0.008379200007766485
       }
     ],
     "scope": "Synthetic timing; not a benchmark speed claim"

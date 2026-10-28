@@ -124,10 +124,18 @@ def frozen_numeric_probe(model,standardized):
         initial = u.new_zeros((1,u.shape[-1]))
         reference_scores,_ = integrate(u,model.scorer.decay,initial,model.scorer.kappa,"reference")
         scan_scores,_ = integrate(u,model.scorer.decay,initial,model.scorer.kappa,"scan",model.config.scan_chunk_size)
-        return dict(raw_error_slice_max_abs=float((d[offset:]-other_d).abs().max().cpu()),
-                    residual_slice_max_abs=float((r[offset:]-other_r).abs().max().cpu()),
-                    evidence_slice_max_abs=float((e[offset:]-other_e).abs().max().cpu()),
-                    evidence_batch_max_abs=float((e-batch_e).abs().max().cpu()),
+        differences = torch.stack(((d[offset:]-other_d).abs().amax((0,2)),
+                                   (r[offset:]-other_r).abs().amax((0,2)),
+                                   (e[offset:]-other_e).abs().amax((0,2)),
+                                   (e-batch_e).abs().amax((0,2))),-1).cpu().numpy()
+        maxima = differences.max(0)
+        return dict(frozen_evidence_backend=model.config.frozen_evidence_backend,
+                    raw_error_slice_max_abs=float(maxima[0]),residual_slice_max_abs=float(maxima[1]),
+                    evidence_slice_max_abs=float(maxima[2]),evidence_batch_max_abs=float(maxima[3]),
+                    evidence_consistency_passed=bool(max(maxima[2:])<=1e-5),
+                    channels_above_evidence_tolerance=[dict(channel=str(model.columns_[i]),raw_error_slice_max_abs=float(row[0]),
+                        residual_slice_max_abs=float(row[1]),evidence_slice_max_abs=float(row[2]),evidence_batch_max_abs=float(row[3]))
+                        for i,row in enumerate(differences) if max(row[2:])>1e-5],
                     score_scan_reference_max_abs=float((scan_scores-reference_scores).abs().max().cpu()),
                     warning="An ECDF can amplify tiny raw-value differences at ties; diagnose on the deployment GPU.",
                     dtype="float32",reference_is_frozen=True)

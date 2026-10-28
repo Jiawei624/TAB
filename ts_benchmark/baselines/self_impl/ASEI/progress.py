@@ -6,7 +6,7 @@ import time
 
 
 logger = logging.getLogger(__name__)
-IMPLEMENTATION_VERSION = "asei-finite-bank-scan-3.2"
+IMPLEMENTATION_VERSION = "asei-finite-bank-scan-3.3"
 
 
 class Progress:

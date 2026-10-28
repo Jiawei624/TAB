@@ -13,6 +13,9 @@ import torch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from ts_benchmark.baselines.self_impl import ASEI
 from ts_benchmark.baselines.self_impl.ASEI.model import EvidenceScorer, Predictor, lag_graph
+from ts_benchmark.baselines.self_impl.ASEI.model import ErrorCorrector
+from ts_benchmark.baselines.self_impl.ASEI.calibration import EvidenceReference
+from ts_benchmark.baselines.self_impl.ASEI.audit import frozen_numeric_probe
 from ts_benchmark.baselines.self_impl.ASEI.progress import IMPLEMENTATION_VERSION
 
 
@@ -48,6 +51,43 @@ def check_recurrence(device,channels,steps):
     return result
 
 
+def check_frozen_evidence(device,channels,backend="canonical"):
+    """Exercise the real FP32 kernels and repeated atoms; no training/data download."""
+    torch.manual_seed(42)
+    model = ASEI(device=str(device),seed=42,frozen_evidence_backend=backend)
+    model._resolve_capacity(8192)
+    model.columns_ = [f"channel_{i}" for i in range(channels)]
+    cfg = model.config
+    values = np.random.default_rng(42).normal(size=(model.history+cfg.ar_order+2048,channels)).astype(np.float32)
+    values[:,::5] = 0  # Constant standardized channels give repeated reference atoms.
+    graph = lag_graph(values,cfg.graph_lags,cfg.graph_neighbors,cfg.graph_sample_cap)
+    model.predictor = Predictor(channels,*graph,hidden=cfg.hidden_dim,embedding=cfg.embedding_dim,
+                                kernel=cfg.kernel_size,dilations=cfg.dilations,win_size=cfg.win_size).to(device)
+    model.corrector = ErrorCorrector(channels,cfg.ar_order,cfg.rho).to(device)
+    with torch.no_grad():
+        model.corrector.beta.fill_(.05)
+        model.corrector.bias.fill_(.02)
+        model.corrector.eta.fill_(.1)
+        model.corrector.mlp[-1].weight.uniform_(-.05,.05)
+        model.corrector.mlp[-1].bias.fill_(.01)
+    for module in (model.predictor,model.corrector):
+        model._freeze(module)
+    d = model._error_tensor(values)
+    r = model._residual_tensor(d)
+    model.reference = EvidenceReference(cfg.evidence_bound).fit(d[cfg.ar_order:].cpu().numpy(),r.cpu().numpy(),device)
+    model.scorer = model._new_scorer()
+    model._freeze(model.scorer)
+    result = frozen_numeric_probe(model,values)
+    result.update(check="frozen_evidence",implementation=IMPLEMENTATION_VERSION,device=str(device),channels=channels,
+                  scope="Synthetic frozen-kernel correctness only; no model training or detection-quality claim")
+    print(json.dumps(result),flush=True)
+    if not result["evidence_consistency_passed"]:
+        raise RuntimeError("Frozen evidence consistency failed; do not start a benchmark with this numerical path")
+    if result["score_scan_reference_max_abs"]>5e-5:
+        raise RuntimeError("State scan differs from the sequential reference beyond tolerance")
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpus",type=int,nargs=1,default=[1])
@@ -59,6 +99,8 @@ def main():
     parser.add_argument("--block-sizes",type=int,nargs="+",default=[128,256])
     parser.add_argument("--threads",type=int,default=4)
     parser.add_argument("--score-steps",type=int,default=1024)
+    parser.add_argument("--frozen-only",action="store_true",help="Check real frozen kernels without training predictor batches")
+    parser.add_argument("--frozen-backend",choices=["canonical","legacy"],default="canonical")
     args = parser.parse_args()
     if min(args.channels,args.batch_size,args.win_size,args.batches,args.threads,args.score_steps,
            args.gpus[0]+1,*args.block_sizes)<1:
@@ -66,6 +108,10 @@ def main():
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpus[0])
     logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
     torch.set_num_threads(args.threads)
+    if args.frozen_only:
+        device = ASEI(device=args.device).device
+        check_frozen_evidence(device,args.channels,args.frozen_backend)
+        return
     for block in args.block_sizes:
         model = ASEI(device=args.device,batch_size=args.batch_size,predictor_block_size=block,win_size=args.win_size)
         model._resolve_capacity(8192)
@@ -92,6 +138,7 @@ def main():
         device = model.device
         del loader,optimizer,model
     check_recurrence(device,args.channels,args.score_steps)
+    check_frozen_evidence(device,args.channels,args.frozen_backend)
 
 
 if __name__=="__main__":
